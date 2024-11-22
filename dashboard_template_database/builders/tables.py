@@ -2,6 +2,7 @@
 # Modules de base
 import os
 import pandas as pd
+from pathlib import Path
 from typing import Dict, Optional, Union
 # Duckdb
 import duckdb
@@ -9,13 +10,37 @@ import duckdb
 # Modules ad hoc
 from .schema import SchemaBuilder
 
+# Emplacement du fichier
+FILE_PATH = Path(os.path.abspath(__file__))
+
+
 # Classe créant les tables correspondant au schéma
 class DuckdbTablesBuilder(SchemaBuilder):
+    """
+    A class to build and manage schema tables in DuckDB.
+
+    This class extends `SchemaBuilder` and provides functionality to create 
+    metadata, dimension, and fact tables in DuckDB, while logging all operations.
+
+    Attributes:
+        conn (duckdb.DuckDBPyConnection): DuckDB connection object.
+    """
 
     # Initialisation
-    def __init__(self, df: pd.DataFrame, categorical_threshold: Optional[int] = 50, connection: Optional[duckdb.DuckDBPyConnection] = None, path : Optional[Union[os.PathLike, None]]=None):
+    def __init__(self, df: pd.DataFrame, categorical_threshold: Optional[int] = 50, connection: Optional[duckdb.DuckDBPyConnection] = None, path : Optional[Union[os.PathLike, None]]=None, log_filename: Optional[os.PathLike] = os.path.join(FILE_PATH.parents[2], "logs/duckdb_schema_builder.log")):
+        """
+        Initialize the DuckdbTablesBuilder class.
+
+        Args:
+            df (pd.DataFrame): The input dataset.
+            categorical_threshold (Optional[int]): Threshold for determining categorical variables.
+            connection (Optional[duckdb.DuckDBPyConnection]): Existing DuckDB connection. Defaults to None.
+            path (Optional[Union[os.PathLike, None]]): Path to the DuckDB database file. Defaults to None.
+            log_filename (Optional[os.PathLike]): Path to the log file. Defaults to a pre-defined path.
+
+        """
         # Initialisation du schéma
-        super().__init__(df=df, categorical_threshold=categorical_threshold)
+        super().__init__(df=df, categorical_threshold=categorical_threshold, log_filename=log_filename)
         
         # Initialisation de la connection
         if (connection is None) & (path is None) :
@@ -27,6 +52,14 @@ class DuckdbTablesBuilder(SchemaBuilder):
     
     # Méthode de création de la table des méta-données
     def create_duckdb_metadata_table(self, table_name: Optional[str] = 'metadata', column_labels: Optional[Dict[str, str]] = None) -> None:
+        """
+        Create a metadata table in DuckDB.
+
+        Args:
+            table_name (Optional[str]): Name of the metadata table in DuckDB. Defaults to 'metadata'.
+            column_labels (Optional[Dict[str, str]]): Optional mapping of column names to labels.
+
+        """
         # Création de la table des méta-données si elle n'existe pas déjà
         if not hasattr(self, 'df_metadata'):
             _ = self.create_metadata_table(column_labels)
@@ -38,9 +71,20 @@ class DuckdbTablesBuilder(SchemaBuilder):
             SELECT * FROM temp_metadata
         """)
         self.conn.execute('DROP VIEW temp_metadata')
+
+        # Logging
+        self.logger.info("Successfully registered duckdb meta-data table")
     
     # Méthode de création des tables de dimensions
     def create_duckdb_dimension_tables(self, table_prefix: Optional[str] = 'dim_', column_labels: Optional[Dict[str, str]] = None) -> None:
+        """
+        Create dimension tables in DuckDB for categorical variables.
+
+        Args:
+            table_prefix (Optional[str]): Prefix for dimension table names. Defaults to 'dim_'.
+            column_labels (Optional[Dict[str, str]]): Optional mapping of column names to labels.
+
+        """
         # Création du dictionnaire des tables de dimensions si elles n'existent pas déjà
         if not hasattr(self, 'dimension_tables'):
             _ = self.create_dimension_tables(column_labels)
@@ -63,9 +107,21 @@ class DuckdbTablesBuilder(SchemaBuilder):
             
             # Ajout de la vue correspondante
             self.conn.execute('DROP VIEW temp_dim')
+
+            # Logging
+            self.logger.info(f"Successfully registered duckdb dimension table for {dim_name}")
     
     # Méthode de création de la table d'informations
     def create_duckdb_fact_table(self, table_name: Optional[str] = 'fact_table', table_prefix: Optional[str] = 'dim_', column_labels: Optional[Dict[str, str]] = None) -> None:
+        """
+        Create a fact table in DuckDB with foreign key relationships to dimension tables.
+
+        Args:
+            table_name (Optional[str]): Name of the fact table in DuckDB. Defaults to 'fact_table'.
+            table_prefix (Optional[str]): Prefix for dimension table names. Defaults to 'dim_'.
+            column_labels (Optional[Dict[str, str]]): Optional mapping of column names to labels.
+
+        """
         # Création de la table d'informations si elle n'existe pas déjà
         if not hasattr(self, 'df_fact'):
             _ = self.create_fact_table(column_labels)
@@ -88,6 +144,8 @@ class DuckdbTablesBuilder(SchemaBuilder):
                 f"LEFT JOIN {dim_table} ON temp_fact.{dim_name} = {dim_table}.value"
             )
             
+            # Logging
+            self.logger.info(f"Successfully created foreign key for dimension '{dim_name}'")
             # Ajout de la colonne qui correspond à une clé étrangère
             # select_columns.append(f"temp_fact.{dim_name}")
         
@@ -106,9 +164,22 @@ class DuckdbTablesBuilder(SchemaBuilder):
 
         # Ajout de la vue
         self.conn.execute('DROP VIEW temp_fact')
+
+        # Logging
+        self.logger.info(f"Successfully registered duckdb fact table")
     
     # Méthode de construction du schéma
     def build_duckdb_schema(self, metadata_table: Optional[str] = 'metadata', fact_table: Optional[str] = 'fact_table', dim_table_prefix: Optional[str] = 'dim_', column_labels: Optional[Dict[str, str]] = None) -> None:
+        """
+        Build the entire schema in DuckDB, including metadata, dimension, and fact tables.
+
+        Args:
+            metadata_table (Optional[str]): Name of the metadata table. Defaults to 'metadata'.
+            fact_table (Optional[str]): Name of the fact table. Defaults to 'fact_table'.
+            dim_table_prefix (Optional[str]): Prefix for dimension tables. Defaults to 'dim_'.
+            column_labels (Optional[Dict[str, str]]): Optional mapping of column names to labels.
+
+        """
         # Création de la table des méta-données
         self.create_duckdb_metadata_table(
             table_name=metadata_table, 
@@ -130,15 +201,19 @@ class DuckdbTablesBuilder(SchemaBuilder):
     
     # Méthode d'affichage du schéma
     def display_schema(self) -> None:
+        """
+        Display the structure of all tables in the DuckDB schema.
+        """
         # Extraction des tables
         tables = self.conn.execute("SHOW TABLES").fetchall()
-        print("Created Tables:")
+        # Logging
+        self.logger.info("\n Created Tables:")
         # Parcours des tables
         for table in tables:
             # Affichage de la structure
-            print(f"\n{table[0]} Structure:")
+            self.logger.info(f"\n {table[0]} Structure:")
             # Extraction des informations relatives à la table
             table_info = self.conn.execute(f"DESCRIBE {table[0]}").fetchall()
             # Affichage de chaque information
             for col in table_info:
-                print(f"  {col[0]}: {col[1]}")
+                self.logger.info(f"  {col[0]}: {col[1]}")
