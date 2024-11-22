@@ -161,3 +161,7 @@ data/*
 # outputs
 outputs/*
 !outputs/.gitkeep
+
+# logs
+logs/*
+!logs/.gitkeep
