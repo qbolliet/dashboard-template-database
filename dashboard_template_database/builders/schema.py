@@ -73,7 +73,7 @@ class SchemaBuilder:
                     'python_type': dtype,
                     'sql_type': self._map_python_to_sql_type(dtype),
                     'is_categorical': False,
-                    'modalities': None
+                    # 'modalities': None
                 }
             else :
                 metadata = {
@@ -82,7 +82,7 @@ class SchemaBuilder:
                     'python_type': dtype,
                     'sql_type': self._map_python_to_sql_type(dtype),
                     'is_categorical': False,
-                    'modalities': None
+                    # 'modalities': None
                 }
             
             # Logging
