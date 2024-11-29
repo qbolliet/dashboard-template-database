@@ -108,7 +108,7 @@ class SchemaBuilder:
             list_metadata.append(metadata)            
         
         # Création d'un DataFrame
-        self.df_metadata = pd.DataFrame.from_dict(list_metadata)
+        self.df_metadata = pd.DataFrame.from_dict(list_metadata).sort_values(by='label', ascending=True, ignore_index=True)
 
         # Logging
         self.logger.info("Successfully built the meta-data DataFrame")
@@ -161,7 +161,7 @@ class SchemaBuilder:
         # Parcours des tables de dimensions
         for categorical_dimension in self.df_metadata.loc[self.df_metadata['is_categorical'], 'name'] :
             # Extraction des modalités
-            self.dimension_tables[categorical_dimension] = pd.Series(self.df[categorical_dimension].unique(), name='label').to_frame().reset_index(names='value')
+            self.dimension_tables[categorical_dimension] = pd.Series(self.df[categorical_dimension].unique(), name='label').to_frame().reset_index(names='value').sort_values(by='label', ascending=True, ignore_index=True)
             # Logging
             self.logger.info(f"Successfully built dimension table for '{categorical_dimension}'")
 
