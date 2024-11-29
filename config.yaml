@@ -1,0 +1,3 @@
+INPUT_DATA : '../data/df_origin.csv'
+OUTPUT_DATA : '../outputs/database.db'
+THRESHOLD : 200

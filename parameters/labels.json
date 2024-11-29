@@ -1,0 +1,11 @@
+{
+    "indicator" : "Indicator",
+    "country" : "Country",
+    "date" : "Date",
+    "value"	: "Value",
+    "kind" : "Kind",
+    "horizon" : "Horizon",
+    "week" : "Week",
+    "model"	: "Model",
+    "training" : "Training"
+}
