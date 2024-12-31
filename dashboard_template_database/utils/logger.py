@@ -4,37 +4,41 @@ import os
 # Logging
 import logging
 
-# Fonction auxiliaire d'initialisation d'un logger
+
+# Fonction d'initialisation du logger
 def _init_logger(filename: os.PathLike) -> logging.Logger:
     """
-    Initializes a logger.
+    Initializes the logger for logging to a file.
 
-    Configures the logging format, level, and file handler.
-    Creates the directory for the log file if it does not exist.
-
-    Args:
-        filename (os.PathLike):
-            The path to the log file.
+    Parameters:
+    - filename (os.PathLike): Path to the log file.
 
     Returns:
-        logging.Logger: The initialized logger.
+    - logging.Logger: Initialized logger object.
+
+    Note:
+    - This function configures logging to output messages to both console and a file.
     """
-    # Configuration du logging
+    # Configuration de logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(message)s",
         encoding="utf-8",
         level=logging.INFO,
     )
 
-    # Vérification de l'existence du dossier pour le fichier de log
+    # Vérification de l'existance du dossier pour le fichier de log
     log_directory = os.path.dirname(filename)
-    # Création du chemin s'il n'existe pas déjà
+
     if (not os.path.exists(log_directory)) & (log_directory != ""):
         os.makedirs(log_directory)
 
     # Configuration du fichier de logs
     file_handler = logging.FileHandler(filename)
     file_handler.setLevel(logging.INFO)
+
+    # Set a formatter for the file handler
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    file_handler.setFormatter(formatter)
 
     # Initialisation du logger
     logger = logging.getLogger()
