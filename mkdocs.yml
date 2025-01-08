@@ -90,8 +90,8 @@ nav:
   - Package description: index.md
   - API Documentation:
     - Builders :
-      - DuckdbTablesBuilder : api/builders/DuckdbTablesBuilder.md
-      - SchemaBuilder : api/builders/SchemaBuilder.md
+      - DuckdbTablesBuilder : api/builders/tables/DuckdbTablesBuilder.md
+      - SchemaBuilder : api/builders/schema/SchemaBuilder.md
     - Loaders :
       - Local :
         - Loader : api/loaders/local/Loader.md
