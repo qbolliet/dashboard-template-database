@@ -3,6 +3,7 @@
 import os
 import pandas as pd
 
+
 # Classe de chargement des données
 class Loader:
     """

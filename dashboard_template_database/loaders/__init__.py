@@ -1,2 +1,2 @@
-from local import *
-from s3 import *
+from .local import *
+from .s3 import *

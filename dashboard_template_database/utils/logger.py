@@ -11,13 +11,13 @@ def _init_logger(filename: os.PathLike) -> logging.Logger:
     Initializes the logger for logging to a file.
 
     Parameters:
-    - filename (os.PathLike): Path to the log file.
+        filename (os.PathLike): Path to the log file.
 
     Returns:
-    - logging.Logger: Initialized logger object.
+        logging.Logger: Initialized logger object.
 
     Note:
-    - This function configures logging to output messages to both console and a file.
+        This function configures logging to output messages to both console and a file.
     """
     # Configuration de logging
     logging.basicConfig(

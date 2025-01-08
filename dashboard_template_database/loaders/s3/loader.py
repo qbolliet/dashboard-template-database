@@ -25,11 +25,6 @@ class S3Loader(_S3Connection):
         load(bucket, key, **kwargs):
             Loads data from a specified S3 object based on its file extension and returns it as a Pandas DataFrame, JSON object,
             Pickle object, or GeoDataFrame, depending on the file extension.
-
-    Example :
-    >>> s3_loader = S3Loader(package='boto3')
-    >>> s3_connection = s3_loader.connect(aws_access_key_id='your_access_key', aws_secret_access_key='your_secret_key')
-    >>> data = s3_loader.load(bucket='your_bucket', key='your_file.csv')
     """
 
     def __init__(self, package: Optional[str] = "boto3") -> None:
@@ -51,10 +46,6 @@ class S3Loader(_S3Connection):
 
         Returns:
             obj: The established S3 connection.
-
-        Example :
-        >>> s3_loader = S3Loader(package='boto3')
-        >>> s3_connection = s3_loader.connect(aws_access_key_id='your_access_key', aws_secret_access_key='your_secret_key')
         """
         # Etablissement d'une connection
         return self._connect(**kwargs)
@@ -70,11 +61,6 @@ class S3Loader(_S3Connection):
 
         Returns:
             obj: The loaded data (Pandas DataFrame, JSON object, Pickle object, or GeoDataFrame).
-
-        Example :
-        >>> s3_loader = S3Loader(package='boto3')
-        >>> s3_connection = s3_loader.connect(aws_access_key_id='your_access_key', aws_secret_access_key='your_secret_key')
-        >>> data = s3_loader.load(bucket='your_bucket', key='your_file.csv')
         """
         # Etablissement d'une connexion s'il n'en existe pas une nouvelle
         if not hasattr(self, "s3"):
@@ -128,12 +114,6 @@ class S3Loader(_S3Connection):
 
         Raises:
             ValueError: If the 'extension' argument is not one of ['csv', 'json', 'pkl', 'geojson', 'parquet'].
-
-        Example :
-        >>> s3_connection = _S3Connection(package='boto3')
-        >>> s3_client = s3_connection._connect(aws_access_key_id='your_access_key', aws_secret_access_key='your_secret_key')
-        >>> s3_file = s3_client.get_object(Bucket='your_bucket', Key='your_file.csv')
-        >>> data = _read_data(s3_file, extension='csv')
         """
         # Test sur l'extension et lecture du fichier
         if extension == "csv":

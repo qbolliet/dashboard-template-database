@@ -31,11 +31,7 @@ class _S3Connection:
         _connect(endpoint_url, aws_access_key_id, aws_secret_access_key, aws_session_token, verify, **kwargs):
             Connects to the S3 bucket with the specified parameters and package.
             Returns the connected S3 client or file system.
-
-    Example :
-    >>> s3_connection = _S3Connection(package='boto3')
-    >>> s3_client = s3_connection._connect(aws_access_key_id='your_access_key', aws_secret_access_key='your_secret_key')
-
+            
     Note:
         Make sure to set the required AWS environment variables for successful connections.
     """
@@ -79,10 +75,6 @@ class _S3Connection:
 
         Raises:
             ValueError: If the 'package' argument is not one of ['s3fs', 'boto3'].
-
-        Example :
-        >>> s3_connection = _S3Connection(package='boto3')
-        >>> s3_client = s3_connection._connect(aws_access_key_id='your_access_key', aws_secret_access_key='your_secret_key')
         """
         # Désactive les warnings en raison de la non vérification du certificat (non recommandé)
         disable_warnings()

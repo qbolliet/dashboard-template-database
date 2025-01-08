@@ -1,1 +1,1 @@
-from loader import S3Loader
+from .loader import S3Loader
