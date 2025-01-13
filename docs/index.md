@@ -53,23 +53,33 @@ mkdocs build --port 5000
 Here's an example of how to use the functions in the package:
 
 ```python
-from bozio_wasmer_simulations import CaptationMarginaleSimulator
+import pandas as pd
+from dashboard_template_database.builders.schema import SchemaBuilder
+from dashboard_template_database.builders.tables import DuckdbTablesBuilder
+from dashboard_template_database.loaders.local.loader import Loader
 
-# Create a simulator object
-simulator = CaptationMarginaleSimulator()
+# Load a sample DataFrame
+loader = Loader()
+sample_data = pd.DataFrame({
+    'Name': ['Alice', 'Bob', 'Charlie'],
+    'Age': [25, 30, 35],
+    'City': ['Paris', 'Berlin', 'Madrid']
+})
 
-# Define a dictionary of reform parameters
-reform_params = {
-    'TYPE': 'fillon',
-    'PARAMS': {
-        'PLAFOND': 2.7,
-        'TAUX_50_SALARIES_ET_PLUS': 0.35,
-        'TAUX_MOINS_DE_50_SALARIES': 0.354
-    }
-}
+# Initialize the SchemaBuilder
+schema_builder = SchemaBuilder(df=sample_data, categorical_threshold=3)
 
-# Simulate a reform
-data_simul = simulator.simulate_reform(name='my_reform', reform_params=reform_params, year=2022, simulation_step_smic=0.1, simulation_max_smic=4)
+# Build the schema
+metadata, dimension_tables, fact_table = schema_builder.build()
+
+# Initialize the DuckDB tables builder
+duckdb_builder = DuckdbTablesBuilder(df=sample_data)
+
+# Create the schema in DuckDB
+duckdb_builder.build_duckdb_schema()
+
+# Display the schema in DuckDB
+duckdb_builder.display_schema()
 ``` 
 
 ## License
