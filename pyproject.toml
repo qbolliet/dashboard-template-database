@@ -18,6 +18,8 @@ s3fs = "^2024.2.0"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"
+pytest = "^8.3.4"
+moto = {extras = ["s3"], version = "^5.0.27"}
 
 [tool.poetry.group.docs.dependencies]
 mkdocs = "^1.6.1"
