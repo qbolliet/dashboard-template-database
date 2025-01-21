@@ -21,7 +21,7 @@ class Loader:
         pass
 
     # Méthode de chargement des données
-    def load(self, path: os.PathLike, **kwargs) -> None:
+    def load(self, path: os.PathLike, **kwargs) -> pd.DataFrame:
         """
         Load data from a file into a pandas DataFrame based on the file's extension.
 
