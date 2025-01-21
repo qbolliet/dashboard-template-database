@@ -26,8 +26,7 @@ The repository is organized as follow :
 
 ```bash
 git clone https://github.com/qbolliet/dashboard-template-database.git
-poetry build
-pip install -e dist/dashboard_template_database-0.1.0-py3-none-any.whl
+poetry install
 ```
 
 The package is then usable as any other python package.
