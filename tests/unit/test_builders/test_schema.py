@@ -11,7 +11,7 @@ from dashboard_template_database.builders import SchemaBuilder
 @pytest.fixture
 def schema_builder(sample_df):
     """Initialization of the SchemaBuilder class."""
-    return SchemaBuilder(sample_df)
+    return SchemaBuilder(sample_df, categorical_threshold=4)
 
 # Fonction de test de l'initialisation de la classe
 def test_schema_builder_initialization(schema_builder, sample_df):
@@ -19,7 +19,7 @@ def test_schema_builder_initialization(schema_builder, sample_df):
     # Vérification de son type et de la bonne initialisation des attributs
     assert isinstance(schema_builder, SchemaBuilder)
     assert schema_builder.df.equals(sample_df)
-    assert schema_builder.categorical_threshold == 50
+    assert schema_builder.categorical_threshold == 4
 
 # Fonction de test de l'association des types en python et en SQL
 def test_map_python_to_sql_type():

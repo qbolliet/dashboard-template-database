@@ -101,7 +101,7 @@ def test_build_duckdb_schema(duckdb_builder):
     assert 'test_dim_status' in table_names
 
 # Test de l'affichage du schéma
-def test_display_schema(duckdb_builder, capsys):
+def test_display_schema(duckdb_builder, caplog):
     """Test the display of the built scheme."""
     # Création du schéma
     duckdb_builder.build_duckdb_schema()
@@ -109,9 +109,8 @@ def test_display_schema(duckdb_builder, capsys):
     duckdb_builder.display_schema()
     
     # Vérification que l'information est bien rendue
-    captured = capsys.readouterr()
-    assert "Created Tables:" in captured.err
-    assert "Structure:" in captured.err
+    assert "Created Tables:" in caplog.text
+    assert "Structure:" in caplog.text
 
 # Vérification de la génération d'erreur pour des tables absentes
 @pytest.mark.parametrize("table_name", ['invalid_table', 'nonexistent'])

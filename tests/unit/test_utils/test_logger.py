@@ -68,5 +68,6 @@ def test_init_logger_file_handler_configuration():
     assert isinstance(file_handler.formatter, logging.Formatter)
     
     # Nettoyage
+    file_handler.close()
     logger.handlers = [] # Suppression des handlers relatifs à la création du fichier
     os.remove(test_log_file)

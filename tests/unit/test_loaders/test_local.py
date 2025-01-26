@@ -1,5 +1,6 @@
 # Importation des modules
 # Modules de base
+import numpy as np
 import pandas as pd
 # Module de test
 import pytest
@@ -49,7 +50,7 @@ def test_loader_initialization(loader):
 # Test du chargement de fichiers CSV
 def test_load_csv(loader, temp_files, sample_df):
     """Test the loading of CSV files"""
-    df = loader.load(str(temp_files['csv']))
+    df = loader.load(str(temp_files['csv']), parse_dates=[3])
     pd.testing.assert_frame_equal(df, sample_df)
 
 # Test du chargement de fichiers Excel
@@ -80,5 +81,5 @@ def test_invalid_extension(loader):
 def test_load_with_kwargs(loader, temp_files, sample_df):
     """Test the loading of CSV files with kwargs"""
     # Test with CSV using specific encoding
-    df = loader.load(str(temp_files['csv']), encoding='utf-8')
+    df = loader.load(str(temp_files['csv']), encoding='utf-8', parse_dates=[3])
     pd.testing.assert_frame_equal(df, sample_df)

@@ -2,7 +2,7 @@
 # Module de tests
 import pytest
 # Modules d'imitation d'un environnement S3
-from moto import mock_s3
+from moto import mock_aws
 # Modules du package à tester
 from dashboard_template_database.loaders.s3 import S3Loader
 from dashboard_template_database.builders import DuckdbTablesBuilder
@@ -26,7 +26,7 @@ class TestFullPipeline:
             'sample_df': sample_df
         }
 
-    @mock_s3
+    @mock_aws
     def test_full_pipeline_execution(self, setup_pipeline):
         """Test the entire pipeline from S3 loading to DuckDB table creation."""
         # Extraction des inputs de la pipeline
@@ -59,7 +59,7 @@ class TestFullPipeline:
         assert 'test_metadata' in tables['name'].values
         assert 'test_fact' in tables['name'].values
 
-    @mock_s3
+    @mock_aws
     def test_pipeline_with_different_file_formats(self, setup_pipeline):
         """Test pipeline with different input file formats."""
         # Extraction des inputs de la pipeline
