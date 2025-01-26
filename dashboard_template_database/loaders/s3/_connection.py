@@ -53,6 +53,7 @@ class _S3Connection:
     def _connect(
         self,
         endpoint_url: Optional[Union[str, None]] = None,
+        region_name: Optional[Union[str, None]] = None,
         aws_access_key_id: Optional[Union[str, None]] = None,
         aws_secret_access_key: Optional[Union[str, None]] = None,
         aws_session_token: Optional[Union[str, None]] = None,
@@ -101,6 +102,11 @@ class _S3Connection:
                     aws_session_token
                     if aws_session_token is not None
                     else os.environ["AWS_SESSION_TOKEN"]
+                ),
+                region_name=(
+                    region_name
+                    if region_name is not None
+                    else os.environ["AWS_DEFAULT_REGION"]
                 ),
                 verify=verify,
                 **kwargs,
