@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url>
+         <loc>https://qbolliet.github.io/dashboard-template-database/</loc>
+         <lastmod>2025-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://qbolliet.github.io/dashboard-template-database/api/builders/schema/SchemaBuilder/</loc>
+         <lastmod>2025-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://qbolliet.github.io/dashboard-template-database/api/builders/tables/DuckdbTablesBuilder/</loc>
+         <lastmod>2025-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://qbolliet.github.io/dashboard-template-database/api/loaders/local/Loader/</loc>
+         <lastmod>2025-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://qbolliet.github.io/dashboard-template-database/api/loaders/s3/S3Loader/</loc>
+         <lastmod>2025-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://qbolliet.github.io/dashboard-template-database/api/loaders/s3/_S3Connection/</loc>
+         <lastmod>2025-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://qbolliet.github.io/dashboard-template-database/api/utils/_init_logger/</loc>
+         <lastmod>2025-02-24</lastmod>
+    </url>
+</urlset>
