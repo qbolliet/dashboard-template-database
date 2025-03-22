@@ -2,6 +2,7 @@ site_name: Dashboard Template Database
 site_url: https://qbolliet.github.io/dashboard-template-database/
 repo_url: https://github.com/qbolliet/dashboard-template-database
 site_dir: site
+docs_dir: docs
 theme:
   name: material
   pygments_style: 'lovelace'
