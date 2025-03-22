@@ -3,8 +3,8 @@
 # import pytest
 # # Modules d'imitation d'un environnement S3
 # from moto import mock_aws
-# # Modules du package à tester
-# from dashboard_template_database.loaders.s3 import S3Loader
+# # Modules du package à tester - Updated imports
+# from dashboard_template_database.storage import Loader
 # from dashboard_template_database.builders import DuckdbTablesBuilder
 
 # @pytest.mark.integration
@@ -12,17 +12,17 @@
 #     """Integration tests for the full data pipeline."""
 
 #     @pytest.fixture
-#     def setup_pipeline(self, s3_bucket_with_files, sample_df):
+#     def setup_pipeline(self, setup_test_bucket, sample_df):
 #         """Setup the complete pipeline with all components."""
 #         # Initialisation du bucket
-#         bucket, _ = s3_bucket_with_files
+#         bucket = setup_test_bucket
         
 #         # Initialisation du loader
-#         s3_loader = S3Loader()
+#         loader = Loader()
         
 #         return {
 #             'bucket': bucket,
-#             'loader': s3_loader,
+#             'loader': loader,
 #             'sample_df': sample_df
 #         }
 
@@ -33,7 +33,12 @@
 #         pipeline = setup_pipeline
         
 #         # 1. Chargement des données depuis s3
-#         df = pipeline['loader'].load(pipeline['bucket'], 'test.csv')
+#         df = pipeline['loader'].load(
+#             filepath='test.csv', 
+#             bucket=pipeline['bucket'],
+#             aws_access_key_id='testing',
+#             aws_secret_access_key='testing'
+#         )
         
 #         # 2. Création des tables DuckDB
 #         db_builder = DuckdbTablesBuilder(df)
@@ -68,12 +73,17 @@
 #         # Parcours des différents formats de fichiers
 #         for file_format in ['csv', 'parquet', 'xlsx']:
 #             # Chargement des données
-#             df = pipeline['loader'].load(pipeline['bucket'], f'test.{file_format}')
+#             df = pipeline['loader'].load(
+#                 filepath=f'test.{file_format}',
+#                 bucket=pipeline['bucket'],
+#                 aws_access_key_id='testing',
+#                 aws_secret_access_key='testing'
+#             )
             
 #             # Création des tables DuckDB
 #             db_builder = DuckdbTablesBuilder(df)
 #             db_builder.build_duckdb_schema()
             
-#             # Vérifiation des données
+#             # Vérification des données
 #             fact_data = db_builder.conn.execute("SELECT * FROM fact_table").fetchdf()
 #             assert len(fact_data) == len(pipeline['sample_df'])

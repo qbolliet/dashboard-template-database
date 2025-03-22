@@ -92,11 +92,15 @@ nav:
     - Builders :
       - DuckdbTablesBuilder : api/builders/tables/DuckdbTablesBuilder.md
       - SchemaBuilder : api/builders/schema/SchemaBuilder.md
-    - Loaders :
+    - Storage :
+      - Loader : api/storage/Loader.md
+      - Saver : api/storage/Saver.md
       - Local :
-        - Loader : api/loaders/local/Loader.md
+        - load_local : api/storage/local/load_local.md
+        - save_local : api/storage/local/save_local.md
       - S3 :
-        - _S3Connection : api/loaders/s3/_S3Connection.md
-        - S3Loader : api/loaders/s3/S3Loader.md
+        - _S3Connection : api/storage/s3/_S3Connection.md
+        - S3Loader : api/storage/s3/S3Loader.md
+        - S3Saver : api/storage/s3/S3Saver.md
     - Utils :
       - _init_logger : api/utils/_init_logger.md

@@ -8,7 +8,7 @@ from io import BytesIO
 # Module de connexion à S3
 import boto3
 import s3fs
-from moto import mock_aws
+#from moto import mock_aws
 # Module de tests
 import pytest
 
@@ -55,11 +55,11 @@ def aws_credentials():
     os.environ['AWS_S3_ENDPOINT'] = 'localhost:5000'
 
 # Initialisation d'une connexion s3
-@pytest.fixture
-def s3_client(aws_credentials):
-    """Set mock AWS boto3 client and endpoint for tests."""
-    with mock_aws():
-        yield boto3.client('s3', region_name='us-east-1')
+# @pytest.fixture
+# def s3_client(aws_credentials):
+#     """Set mock AWS boto3 client and endpoint for tests."""
+#     with mock_aws():
+#         yield boto3.client('s3', region_name='us-east-1')
 
 # Initialisation d'un bucket avec des fichiers
 @pytest.fixture
@@ -82,12 +82,12 @@ def setup_test_bucket(s3_client, s3_bucket, sample_df):
     return s3_bucket
 
 # Fonction d'initialisation d'un client s3fs
-@pytest.fixture(autouse=True)
-def mock_s3fs(aws_credentials):
-    """Set mock AWS s3fsclient and endpoint for tests."""
-    with mock_aws():
-        fs = s3fs.S3FileSystem(client_kwargs={'endpoint_url': 'http://localhost:5000'})
-        yield fs
+# @pytest.fixture(autouse=True)
+# def mock_s3fs(aws_credentials):
+#     """Set mock AWS s3fsclient and endpoint for tests."""
+#     with mock_aws():
+#         fs = s3fs.S3FileSystem(client_kwargs={'endpoint_url': 'http://localhost:5000'})
+#         yield fs
 
 # Fonction auxliaire d'exportation d'un fichier excel
 def _create_excel_file(df):
@@ -103,3 +103,32 @@ def _create_excel_file(df):
 def setup_logging(caplog):
     """Set logging for tests."""
     caplog.set_level(logging.INFO)
+
+# Créer une nouvelle fixture pour les tests de fichiers temporaires
+@pytest.fixture
+def temp_files(sample_df, tmp_path):
+    """Initialization of the files to load and save."""
+    # Création de fichiers temporaires de différents formats
+    files = {}
+    
+    # CSV
+    csv_path = tmp_path / "test.csv"
+    sample_df.to_csv(csv_path, index=False)
+    files['csv'] = csv_path
+    
+    # Excel
+    xlsx_path = tmp_path / "test.xlsx"
+    sample_df.to_excel(xlsx_path, index=False, engine='openpyxl')
+    files['xlsx'] = xlsx_path
+    
+    # Pickle
+    pkl_path = tmp_path / "test.pkl"
+    sample_df.to_pickle(pkl_path)
+    files['pkl'] = pkl_path
+    
+    # Parquet
+    parquet_path = tmp_path / "test.parquet"
+    sample_df.to_parquet(parquet_path)
+    files['parquet'] = parquet_path
+    
+    return files
