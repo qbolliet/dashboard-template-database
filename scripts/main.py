@@ -9,7 +9,7 @@ FILE_PATH = Path(os.path.abspath(__file__))
 
 # Importation des modules ad hoc
 from dashboard_template_database.builders.tables import DuckdbTablesBuilder
-from dashboard_template_database.loaders.local.loader import Loader
+from dashboard_template_database.storage.loader import Loader
 
 # Chargement du fichier de configurations
 with open(os.path.join(FILE_PATH.parents[1], "config.yaml")) as file:
@@ -24,7 +24,7 @@ if __name__ == '__main__' :
     # Initialisation du loader
     loader = Loader()
     # Importation des données
-    df = loader.load(config['INPUT_DATA'])
+    df = loader.load(filepath=config['INPUT_DATA'])
 
     # Initialisation du builder
     builder = DuckdbTablesBuilder(df=df, categorical_threshold=config['THRESHOLD'], path=config['OUTPUT_DATA'])
