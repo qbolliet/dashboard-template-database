@@ -10,6 +10,9 @@ from typing import Any
 import duckdb
 import narwhals as nw
 
+# Import des utilitaires
+from ...utils.sql import quote_ident
+
 # Import du gestionnaire de base
 from .base import BaseSchemaManager
 
@@ -541,14 +544,14 @@ class DimensionManager(BaseSchemaManager):
 
                 # Suppression des entrées orphelines.
                 # Cast explicite en VARCHAR pour garantir la compatibilité de types
-                # entre
-                # dim_*.value (VARCHAR) et fact_table.{dim_col} (type quelconque)
+                # entre dim_*.value (VARCHAR) et fact_table.{dim_col} (type quelconque)
+                quoted_dim_col = quote_ident(dim_col)
                 cleanup_query = f"""
                     DELETE FROM {table_name}
                     WHERE value NOT IN (
-                        SELECT DISTINCT CAST({dim_col} AS VARCHAR)
+                        SELECT DISTINCT CAST({quoted_dim_col} AS VARCHAR)
                         FROM {self._qualified("fact_table")}
-                        WHERE {dim_col} IS NOT NULL
+                        WHERE {quoted_dim_col} IS NOT NULL
                     )
                 """
                 self.conn.execute(cleanup_query)
@@ -656,26 +659,29 @@ class DimensionManager(BaseSchemaManager):
 
             # Alias 'f' sur la table cible : la table étant qualifiée par le schéma,
             # un alias garde les références corrélées de la sous-requête sans ambiguïté.
+            # Identifiant de colonne issu des données : présent plusieurs fois dans la
+            # requête (SET, sous-requête corrélée, WHERE) → mise entre guillemets.
+            quoted_col = quote_ident(col_name)
             if values_to_labels:
                 # Conversion values → labels (pour revenir aux données originales)
                 update_query = f"""
                     UPDATE {fact_table} AS f
-                    SET {col_name} = (
+                    SET {quoted_col} = (
                         SELECT label FROM temp_dim_mapping
-                        WHERE temp_dim_mapping.value = f.{col_name}
+                        WHERE temp_dim_mapping.value = f.{quoted_col}
                     )
-                    WHERE f.{col_name} IS NOT NULL
+                    WHERE f.{quoted_col} IS NOT NULL
                 """
                 operation = "values to labels"
             else:
                 # Conversion labels → values (pour utiliser les index de dimension)
                 update_query = f"""
                     UPDATE {fact_table} AS f
-                    SET {col_name} = (
+                    SET {quoted_col} = (
                         SELECT value FROM temp_dim_mapping
-                        WHERE temp_dim_mapping.label = f.{col_name}
+                        WHERE temp_dim_mapping.label = f.{quoted_col}
                     )
-                    WHERE f.{col_name} IS NOT NULL
+                    WHERE f.{quoted_col} IS NOT NULL
                 """
                 operation = "labels to values"
 

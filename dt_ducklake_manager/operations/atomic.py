@@ -6,7 +6,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 # DuckDB
@@ -30,9 +29,6 @@ from ..maintenance.recovery import (
 from ..utils.logger import _init_logger
 from .deleter import DatabaseDeleter
 from .updater import DatabaseUpdater
-
-# Emplacement du fichier
-FILE_PATH = Path(os.path.abspath(__file__))
 
 
 # Type d'opération
@@ -171,12 +167,13 @@ class AtomicDatabaseOperations:
         # sous-jacent au même titre que le schéma.
         self.catalog_alias = catalog_alias
 
-        # Initialisation du logger
-        if log_filename is None:
-            log_filename = os.path.join(
-                FILE_PATH.parents[2], "logs/atomic_operations.log"
-            )
-        self.logger = _init_logger(filename=log_filename)
+        # Initialisation du logger nommé.
+        # Chemin par défaut centralisé dans utils.logger : <cwd>/logs/<name>.log.
+        # log_filename (souvent None) est propagé tel quel aux gestionnaires
+        # sous-jacents, qui retombent alors chacun sur leur propre fichier nommé.
+        self.logger = _init_logger(
+            filename=log_filename, name="atomic_operations"
+        )
 
         # Initialisation des gestionnaires
         self.transaction_mgr = TransactionManager(
@@ -536,7 +533,6 @@ class AtomicDatabaseOperations:
             >>> cleanup_config = {
             ...     'remove_orphaned_dimensions': True,
             ...     'remove_null_columns': True,
-            ...     'remove_unused_indexes': True,
             ...     'filters': "status = 'deleted'"  # Remove specific rows
             ... }
             >>> result = atomic_ops.execute_cleanup_operation(cleanup_config)

@@ -255,13 +255,16 @@ def test_qualified_prefixes_schema(
 ) -> None:
     """Test that _qualified prefixes the table name with the manager's schema.
 
+    The in-memory test connection has no attached catalog, so ``_qualified``
+    quotes and schema-qualifies the name without a catalog prefix.
+
     Args:
         built_ducklake_schema: Fixture providing a DuckDB connection with a built
         schema.
     """
     mgr = DimensionManager(connection=built_ducklake_schema, schema="predictions")
-    assert mgr._qualified("fact_table") == "predictions.fact_table"
-    assert mgr._qualified("dim_category") == "predictions.dim_category"
+    assert mgr._qualified("fact_table") == '"predictions"."fact_table"'
+    assert mgr._qualified("dim_category") == '"predictions"."dim_category"'
 
 
 # Test que le schéma par défaut est 'main'
@@ -276,7 +279,7 @@ def test_default_schema_is_main(
     """
     mgr = DimensionManager(connection=built_ducklake_schema)
     assert mgr.schema == "main"
-    assert mgr._qualified("metadata") == "main.metadata"
+    assert mgr._qualified("metadata") == '"main"."metadata"'
 
 
 # Test que l'alias du catalogue est conservé au même titre que le schéma

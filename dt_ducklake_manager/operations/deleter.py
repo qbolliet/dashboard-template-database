@@ -506,20 +506,7 @@ class DatabaseDeleter(BaseSchemaManager):
             # Traitement de chaque colonne
             for column in valid_columns:
                 try:
-                    # Étape 1: Suppression des index liés à la colonne
-                    operation = TransactionOperation(
-                        operation_type="drop_indexes",
-                        operation_func=self._drop_column_indexes_safe,
-                        operation_args=(column,),
-                        rollback_func=self._restore_column_indexes,
-                        rollback_args=(column,),
-                        description=f"Drop indexes for column {column}",
-                    )
-
-                    self.transaction_mgr.add_operation(tx_id, **operation.__dict__)
-                    self.transaction_mgr.execute_operation(tx_id)
-
-                    # Étape 2: Suppression de la table de dimension si applicable
+                    # Étape 1: Suppression de la table de dimension si applicable
                     if self._is_dimension_column(column):
                         operation = TransactionOperation(
                             operation_type="drop_dimension",
@@ -533,7 +520,7 @@ class DatabaseDeleter(BaseSchemaManager):
                         self.transaction_mgr.add_operation(tx_id, **operation.__dict__)
                         self.transaction_mgr.execute_operation(tx_id)
 
-                    # Étape 3: Suppression de la colonne de la fact table
+                    # Étape 2: Suppression de la colonne de la fact table
                     operation = TransactionOperation(
                         operation_type="drop_column",
                         operation_func=self._drop_fact_table_column,
@@ -546,7 +533,7 @@ class DatabaseDeleter(BaseSchemaManager):
                     self.transaction_mgr.add_operation(tx_id, **operation.__dict__)
                     self.transaction_mgr.execute_operation(tx_id)
 
-                    # Étape 4: Suppression des métadonnées
+                    # Étape 3: Suppression des métadonnées
                     operation = TransactionOperation(
                         operation_type="drop_metadata",
                         operation_func=self.delete_column_metadata,
@@ -566,17 +553,6 @@ class DatabaseDeleter(BaseSchemaManager):
                     self.logger.error(f"Error processing column {column}: {e}")
                     results[column] = False
                     # Continue avec les autres colonnes
-
-            # Nettoyage final des index orphelins
-            operation = TransactionOperation(
-                operation_type="cleanup_indexes",
-                operation_func=self._cleanup_orphaned_indexes,
-                operation_args=(),
-                description="Clean up orphaned indexes",
-            )
-
-            self.transaction_mgr.add_operation(tx_id, **operation.__dict__)
-            self.transaction_mgr.execute_operation(tx_id)
 
             # Validation post-suppression
             if self.enable_validation and self.auditor:
@@ -637,9 +613,6 @@ class DatabaseDeleter(BaseSchemaManager):
             # Parcours des colonnes
             for column in valid_columns:
                 try:
-                    # Suppression des index
-                    self._drop_column_indexes_safe(column)
-
                     # Suppression de la dimension si applicable
                     if self._is_dimension_column(column):
                         self.dimension_mgr.delete_dimension_table(column)
@@ -656,13 +629,6 @@ class DatabaseDeleter(BaseSchemaManager):
                     # Logging
                     self.logger.error(f"Error deleting column {column}: {e}")
                     results[column] = False
-
-            # Nettoyage des index orphelins
-            try:
-                self._cleanup_orphaned_indexes()
-            except Exception as e:
-                # Logging
-                self.logger.warning(f"Error cleaning orphaned indexes: {e}")
 
             # Ajout des colonnes non trouvées au résultat
             for col in columns:
@@ -685,42 +651,6 @@ class DatabaseDeleter(BaseSchemaManager):
             return {col: False for col in columns}
 
     # Méthodes de suppression sécurisées
-    # Méthode auxiliaire de suppression des indexes liés à une colonne
-    def _drop_column_indexes_safe(self, column: str) -> list[str]:
-        """Safely drop indexes related to a column."""
-        try:
-            # Initialisation de la liste des indexes supprimés
-            dropped_indexes = []
-
-            # Recherche des index utilisant cette colonne
-            index_query = """
-                SELECT index_name, expressions
-                FROM duckdb_indexes()
-                WHERE expressions LIKE ?
-            """
-            indexes = self.conn.execute(index_query, [f"%{column}%"]).fetchall()
-
-            # Parcours des indexes utilisant la colonne et qu'il faut supprimer
-            for index_name, expressions in indexes:
-                try:
-                    # Requête de suppression
-                    drop_query = f"DROP INDEX IF EXISTS {index_name}"
-                    self.conn.execute(drop_query)
-                    # Ajout à la liste des indexes supprimés
-                    dropped_indexes.append(index_name)
-                    # Logging
-                    self.logger.info(f"Dropped index {index_name} for column {column}")
-                except Exception as e:
-                    # Logging
-                    self.logger.warning(f"Failed to drop index {index_name}: {e}")
-
-            return dropped_indexes
-
-        except Exception as e:
-            # Logging
-            self.logger.error(f"Error dropping indexes for column {column}: {e}")
-            return []
-
     # Méthode auxiliaire de suppression d'une colonne de la table des faits
     def _drop_fact_table_column(self, column: str) -> bool:
         """Drop a column from the fact table."""
@@ -810,7 +740,6 @@ class DatabaseDeleter(BaseSchemaManager):
             results: dict[str, Any] = {
                 "orphaned_dimensions": {},
                 "null_columns": [],
-                "orphaned_indexes": [],
                 "new_categoricals": [],
             }
 
@@ -821,7 +750,7 @@ class DatabaseDeleter(BaseSchemaManager):
 
             # Étape 2: Suppression des colonnes ne contenant que des nulles
             # Utilisation de delete_columns pour assurer le nettoyage complet
-            # (dimensions, indexes, métadonnées)
+            # (dimensions, métadonnées)
             null_only_columns = self._get_null_only_columns()
             if null_only_columns:
                 # Suppression via delete_columns (sans transaction car déjà dans un
@@ -834,10 +763,7 @@ class DatabaseDeleter(BaseSchemaManager):
                     col for col, success in column_results.items() if success
                 ]
 
-            # Étape 3: Nettoyage des index orphelins
-            results["orphaned_indexes"] = self._cleanup_orphaned_indexes()
-
-            # Étape 4: Détection des variables devenues catégorielles après suppression
+            # Étape 3: Détection des variables devenues catégorielles après suppression
             results["new_categoricals"] = self._detect_new_categorical_after_deletion()
 
             return results
@@ -847,53 +773,6 @@ class DatabaseDeleter(BaseSchemaManager):
             self.logger.error(f"Error during comprehensive cleanup: {e}")
             return {}
 
-    # Méthode auxiliaire de suppression des index orphelins
-    def _cleanup_orphaned_indexes(self) -> list[str]:
-        """Clean up orphaned indexes."""
-        try:
-            # Initialisation de la liste des indexs nettoyés
-            cleaned_indexes = []
-            # Liste des colonnes existantes
-            existing_columns = set(self._get_fact_table_columns())
-
-            # Récupération de tous les index
-            all_indexes = self.conn.execute("""
-                SELECT index_name, expressions
-                FROM duckdb_indexes()
-            """).fetchall()
-            # Parcours des indexs
-            for index_name, expressions in all_indexes:
-                # Analyse des colonnes référencées
-                referenced_columns = []
-                # Vérification de l'existence de la colonne à laquelle se rapporte
-                # l'index
-                for col in existing_columns:
-                    if col in expressions or f"fact_table.{col}" in expressions:
-                        referenced_columns.append(col)
-
-                # Si l'index ne référence aucune colonne existante mais référence
-                # fact_table
-                if not referenced_columns and "fact_table" in expressions:
-                    try:
-                        # Exécution de la requête de suppression de l'index
-                        self.conn.execute(f"DROP INDEX IF EXISTS {index_name}")
-                        # Ajout à la liste des index supprimés
-                        cleaned_indexes.append(index_name)
-                        # Logging
-                        self.logger.info(f"Cleaned orphaned index: {index_name}")
-                    except Exception as e:
-                        # Logging
-                        self.logger.error(
-                            f"Failed to drop orphaned index {index_name}: {e}"
-                        )
-
-            return cleaned_indexes
-
-        except Exception as e:
-            # Logging
-            self.logger.error(f"Error cleaning orphaned indexes: {e}")
-            return []
-
     # Méthodes de rollback
     # Méthode auxiliaire de restauration des lignes supprimées
     def _restore_deleted_rows(
@@ -902,15 +781,6 @@ class DatabaseDeleter(BaseSchemaManager):
         """Restore deleted rows (placeholder - handled by DuckDB transaction)."""
         # Logging
         self.logger.info("Deleted rows restoration handled by database transaction")
-        return True
-
-    # Méthode auxiliaire de restauration des index d'une colonne
-    def _restore_column_indexes(self, column: str) -> bool:
-        """Restore column indexes (placeholder - handled by DuckDB transaction)."""
-        # Logging
-        self.logger.info(
-            f"Column indexes restoration for {column} handled by database transaction"
-        )
         return True
 
     # Méthode auxiliaire de restaurarion de la table de dimension associée à une colonne
@@ -965,7 +835,7 @@ class DatabaseDeleter(BaseSchemaManager):
         """Analyze column dependencies for deletion impact assessment.
 
         Examines each column for dependencies including dimension tables,
-        indexes, primary key status, and critical references.
+        primary key status, and critical references.
 
         Args:
             columns: List of column names to analyze.
@@ -992,7 +862,6 @@ class DatabaseDeleter(BaseSchemaManager):
                 column_deps = {
                     "is_categorical": self._is_dimension_column(column),
                     "has_dimension_table": False,
-                    "has_indexes": False,
                     # Placeholder — nécessiterait une analyse des logs
                     "referenced_in_queries": False,
                 }
@@ -1004,20 +873,6 @@ class DatabaseDeleter(BaseSchemaManager):
                         dim_table_name
                     )
 
-                # Vérification des index
-                try:
-                    index_query = """
-                        SELECT COUNT(*) FROM duckdb_indexes()
-                        WHERE expressions LIKE ?
-                    """
-                    _idx_row = self.conn.execute(
-                        index_query, [f"%{column}%"]
-                    ).fetchone()
-                    index_count = _idx_row[0] if _idx_row is not None else 0
-                    column_deps["has_indexes"] = index_count > 0
-                except Exception:
-                    column_deps["has_indexes"] = False
-
                 # Avertissements
                 # Vérification des association variable catégorielle - table de
                 # dimension
@@ -1025,11 +880,6 @@ class DatabaseDeleter(BaseSchemaManager):
                     dependency_report["warnings"].append(
                         f"Column {column} has associated dimension table that will be"
                         f" deleted"
-                    )
-                # Vérification des indexes associés à une colonne
-                if column_deps["has_indexes"]:
-                    dependency_report["warnings"].append(
-                        f"Column {column} has associated indexes that will be dropped"
                     )
 
                 # Vérification si la colonne est une clé primaire (dépendance critique)
@@ -1088,7 +938,6 @@ class DatabaseDeleter(BaseSchemaManager):
                 "columns_affected": [],
                 "column_dependencies": {},
                 "dimension_tables_affected": [],
-                "indexes_affected": [],
                 "warnings": [],
                 "recommendations": [],
             }
@@ -1136,9 +985,6 @@ class DatabaseDeleter(BaseSchemaManager):
                     # Identification des tables de dimension affectées
                     if deps["has_dimension_table"]:
                         impact_report["dimension_tables_affected"].append(f"dim_{col}")
-                    # Identification des index affectés
-                    if deps["has_indexes"]:
-                        impact_report["indexes_affected"].append(col)
 
             # Génération des recommandations
             if impact_report["rows_affected"] > 1000:
@@ -1149,11 +995,6 @@ class DatabaseDeleter(BaseSchemaManager):
             if len(impact_report["dimension_tables_affected"]) > 0:
                 impact_report["recommendations"].append(
                     "Review dimension table dependencies before deletion"
-                )
-
-            if len(impact_report["indexes_affected"]) > 0:
-                impact_report["recommendations"].append(
-                    "Consider recreating important indexes after column deletion"
                 )
 
             return impact_report
@@ -1257,7 +1098,6 @@ class DatabaseDeleter(BaseSchemaManager):
                     "orphaned_dimensions": (
                         self.dimension_mgr.cleanup_orphaned_dimension_entries()
                     ),
-                    "orphaned_indexes": self._cleanup_orphaned_indexes(),
                 }
                 # Logging
                 self.logger.info("Basic database cleanup completed")

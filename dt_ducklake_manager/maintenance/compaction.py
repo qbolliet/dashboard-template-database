@@ -2,16 +2,12 @@
 # Modules de base
 import os
 from datetime import datetime, timedelta
-from pathlib import Path
 
 # DuckDB
 import duckdb
 
 # Module d'initialisation du logger
 from ..utils.logger import _init_logger
-
-# Emplacement du fichier
-FILE_PATH = Path(os.path.abspath(__file__))
 
 
 # Classe de maintenance d'un catalogue DuckLake
@@ -52,9 +48,7 @@ class DuckLakeMaintenance:
         connection: duckdb.DuckDBPyConnection,
         catalog_alias: str = "db",
         schema: str = "main",
-        log_filename: str | os.PathLike[str] | None = os.path.join(
-            FILE_PATH.parents[2], "logs/ducklake_maintenance.log"
-        ),
+        log_filename: str | os.PathLike[str] | None = None,
     ) -> None:
         """
         Initialize the DuckLakeMaintenance manager.
@@ -80,12 +74,11 @@ class DuckLakeMaintenance:
         self.catalog_alias = catalog_alias
         self.schema = schema
 
-        # Initialisation du logger
-        if log_filename is None:
-            log_filename = os.path.join(
-                FILE_PATH.parents[2], "logs/ducklake_maintenance.log"
-            )
-        self.logger = _init_logger(filename=log_filename)
+        # Initialisation du logger nommé.
+        # Chemin par défaut centralisé dans utils.logger : <cwd>/logs/<name>.log.
+        self.logger = _init_logger(
+            filename=log_filename, name="ducklake_maintenance"
+        )
 
     # ---------------------------------------------------------------------------
     # Méthodes de maintenance individuelles

@@ -3,7 +3,6 @@
 import os
 import threading
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import Any
 
 # DuckDB
@@ -14,11 +13,8 @@ from narwhals.typing import IntoDataFrame
 
 # Import des utilitaires
 from ...utils.logger import _init_logger
-from ...utils.sql import qualify_table
+from ...utils.sql import qualify_table, quote_ident, resolve_catalog
 from ...utils.types import map_python_to_sql_type
-
-# Emplacement du fichier
-FILE_PATH = Path(os.path.abspath(__file__))
 
 
 # Classe contenant des opérations utilitaires de base sur la base de données au schéma
@@ -91,35 +87,42 @@ class BaseSchemaManager(ABC):
         # que plusieurs catalogues sont attachés à la même connexion).
         self.catalog_alias = catalog_alias
 
-        # Initialisation du logger pour traçabilité des opérations
-        if log_filename is None:
-            log_filename = os.path.join(
-                FILE_PATH.parents[3], "logs/base_schema_manager.log"
-            )
-        self.logger = _init_logger(filename=log_filename)
+        # Alias de catalogue effectif : l'alias n'est utilisé pour qualifier les
+        # tables que s'il correspond à une base réellement attachée. Les connexions
+        # in-memory des tests n'attachent aucun catalogue : la qualification retombe
+        # alors sur le seul schéma.
+        self._catalog = resolve_catalog(self.conn, self.catalog_alias)
+
+        # Initialisation du logger nommé pour traçabilité des opérations.
+        # Chemin par défaut centralisé dans utils.logger : <cwd>/logs/<name>.log.
+        self.logger = _init_logger(
+            filename=log_filename, name="base_schema_manager"
+        )
 
         # Cache thread-safe pour optimiser les accès aux métadonnées
         self._metadata_cache: nw.DataFrame[Any] | None = None
         self._cache_lock = threading.RLock()
 
-    # Méthode de qualification d'un nom de table par le schéma du gestionnaire
+    # Méthode de qualification d'un nom de table par le schéma (et le catalogue)
     def _qualified(self, table: str) -> str:
         """
-        Return a table name qualified by this manager's schema.
+        Return a table name qualified by this manager's schema and catalog.
 
         Args:
             table: Bare table name (e.g. ``'fact_table'``, ``'dim_country'``).
 
         Returns:
-            The ``'<schema>.<table>'`` identifier targeting :attr:`schema`.
+            The quoted, qualified identifier targeting :attr:`schema` (and the
+            catalog alias when one is actually attached).
 
         Example:
             >>> manager.schema = 'predictions'
             >>> manager._qualified('fact_table')
-            'predictions.fact_table'
+            '"predictions"."fact_table"'
         """
-        # Délégation à l'utilitaire central de qualification
-        return qualify_table(table, self.schema)
+        # Délégation à l'utilitaire central de qualification, en propageant l'alias
+        # de catalogue effectif (None pour les connexions in-memory des tests).
+        return qualify_table(table, self.schema, self._catalog)
 
     # Méthodes de gestion du cache des métadonnées
     # Méthode de chargement des méta-données
@@ -521,7 +524,7 @@ class BaseSchemaManager(ABC):
                 # Vérification si la colonne ne contient que des valeurs nulles
                 query = (
                     f"SELECT COUNT(*) FROM {self._qualified('fact_table')} "
-                    f"WHERE {column} IS NOT NULL"
+                    f"WHERE {quote_ident(column)} IS NOT NULL"
                 )
                 _row = self.conn.execute(query).fetchone()
                 non_null_count = _row[0] if _row is not None else 0

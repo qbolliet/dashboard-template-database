@@ -20,6 +20,7 @@ from ..maintenance.auditor import DatabaseAuditor, IssueSeverity, ValidationLeve
 # Import des utilitaires
 from ..utils.sql import (
     build_database_duplicate_removal_query,
+    quote_ident,
     remove_dataframe_duplicates,
 )
 
@@ -498,7 +499,6 @@ class DatabaseUpdater(BaseSchemaManager):
             check_duplicates_update: Whether to check and remove duplicates in update
             data.
             keep: Duplicate handling strategy ('first', 'last', or False).
-            index_config: Optional index configuration dictionary.
             use_batch_processing: Whether to use batch processing for large datasets.
 
         Returns:
@@ -649,9 +649,9 @@ class DatabaseUpdater(BaseSchemaManager):
                 # Récupération des valeurs distinctes dans fact_table (état post-upsert)
                 db_values_series = nw.from_native(
                     self.conn.execute(
-                        f"SELECT DISTINCT {col_name} FROM"
-                        f" {self._qualified('fact_table')} WHERE {col_name}"
-                        f" IS NOT NULL"
+                        f"SELECT DISTINCT {quote_ident(col_name)} FROM"
+                        f" {self._qualified('fact_table')} WHERE"
+                        f" {quote_ident(col_name)} IS NOT NULL"
                     ).pl()[col_name],
                     series_only=True,
                 )
@@ -877,7 +877,10 @@ class DatabaseUpdater(BaseSchemaManager):
             # composites :
             # chaque colonne du DataFrame (alias upd) est comparée à la fact_table
             # (alias f).
-            conditions = " AND ".join([f"f.{key} = upd.{key}" for key in primary_keys])
+            conditions = " AND ".join(
+                f"f.{quote_ident(key)} = upd.{quote_ident(key)}"
+                for key in primary_keys
+            )
 
             # Enregistrement dans DuckDB
             self.conn.register("_upd_split", df.to_arrow().select(df.columns))
@@ -1010,23 +1013,6 @@ class DatabaseUpdater(BaseSchemaManager):
         except Exception as e:
             # Logging
             self.logger.error(f"Error rolling back fact table changes: {e}")
-            return False
-
-    # Méthode auxiliaire de rollback des changements d'index.
-    def _rollback_index_changes(self) -> bool:
-        """Rollback index changes (handled by DuckDB transaction).
-
-        Returns:
-            True if rollback succeeded, False on error.
-        """
-        try:
-            # Les changements d'index sont gérés par la transaction DuckDB
-            # Logging
-            self.logger.info("Index changes rolled back")
-            return True
-        except Exception as e:
-            # Logging
-            self.logger.error(f"Error rolling back index changes: {e}")
             return False
 
     # Méthodes utilitaires

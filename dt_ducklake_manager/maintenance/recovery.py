@@ -18,7 +18,7 @@ from .._internal.managers.dimension import DimensionManager
 
 # Import des utilitaires
 from ..utils.logger import _init_logger
-from ..utils.sql import qualify_table
+from ..utils.sql import qualify_table, quote_ident, resolve_catalog
 
 # Import des gestionnaires
 from .auditor import DatabaseAuditor, ValidationIssue, ValidationLevel
@@ -181,6 +181,10 @@ class DatabaseRecoveryManager:
         self.catalog_alias = catalog_alias
         self.schema = schema
 
+        # Alias de catalogue effectif : qualification par le catalogue uniquement
+        # s'il est réellement attaché (None pour les connexions in-memory des tests).
+        self._catalog = resolve_catalog(self.conn, self.catalog_alias)
+
         # Configuration des répertoires
         if backup_dir is None:
             backup_dir = os.path.join(FILE_PATH.parents[2], "data/backups")
@@ -197,12 +201,9 @@ class DatabaseRecoveryManager:
             catalog_alias=catalog_alias,
         )
 
-        # Initialisation du logger
-        if log_filename is None:
-            log_filename = os.path.join(
-                FILE_PATH.parents[2], "logs/database_recovery.log"
-            )
-        self.logger = _init_logger(filename=log_filename)
+        # Initialisation du logger nommé.
+        # Chemin par défaut centralisé dans utils.logger : <cwd>/logs/<name>.log.
+        self.logger = _init_logger(filename=log_filename, name="database_recovery")
 
         # Configuration
         self.categorical_threshold = categorical_threshold
@@ -213,18 +214,19 @@ class DatabaseRecoveryManager:
         self._recovery_points: dict[str, RecoveryPoint] = {}
         self._load_existing_recovery_points()
 
-    # Méthode de qualification d'un nom de table par le schéma cible
+    # Méthode de qualification d'un nom de table par le schéma (et le catalogue) cible
     def _qualified(self, table: str) -> str:
-        """Return a table name qualified by this manager's schema.
+        """Return a table name qualified by this manager's schema and catalog.
 
         Args:
             table: Bare table name (e.g. ``'fact_table'``).
 
         Returns:
-            The ``'<schema>.<table>'`` identifier.
+            The quoted, qualified identifier (catalog-qualified when an alias is
+            actually attached).
         """
-        # Délégation à l'utilitaire central de qualification
-        return qualify_table(table, self.schema)
+        # Délégation à l'utilitaire central de qualification, alias effectif propagé
+        return qualify_table(table, self.schema, self._catalog)
 
     # Méthodes de gestion des points de récupération
     # Méthode de création d'un point de récupération
@@ -913,8 +915,8 @@ class DatabaseRecoveryManager:
                     )
                     fact_table = self._qualified("fact_table")
                     values_pl = self.conn.execute(
-                        f"SELECT DISTINCT {col_name} FROM {fact_table}"
-                        f" WHERE {col_name} IS NOT NULL"
+                        f"SELECT DISTINCT {quote_ident(col_name)} FROM"
+                        f" {fact_table} WHERE {quote_ident(col_name)} IS NOT NULL"
                     ).pl()[col_name]
                     values_nw = nw.from_native(values_pl, series_only=True)
                     dim_mgr.update_dimension_values(col_name, values_nw)
@@ -965,7 +967,8 @@ class DatabaseRecoveryManager:
             for col_name, col_type in required_columns.items():
                 if col_name not in existing_columns:
                     self.conn.execute(
-                        f"ALTER TABLE {metadata_table} ADD COLUMN {col_name} {col_type}"
+                        f"ALTER TABLE {metadata_table} ADD COLUMN"
+                        f" {quote_ident(col_name)} {col_type}"
                     )
                     self.logger.info(
                         f"Added missing column {col_name} to metadata table"
@@ -1029,9 +1032,9 @@ class DatabaseRecoveryManager:
                         # Recréation de la table de dimension à partir de la fact_table.
                         # update_dimension_values crée la table si elle n'existe pas.
                         values_pl = self.conn.execute(
-                            f"SELECT DISTINCT {col_name} FROM"
+                            f"SELECT DISTINCT {quote_ident(col_name)} FROM"
                             f" {self._qualified('fact_table')} WHERE"
-                            f" {col_name} IS NOT NULL"
+                            f" {quote_ident(col_name)} IS NOT NULL"
                         ).pl()[col_name]
                         values_nw = nw.from_native(values_pl, series_only=True)
                         added = dim_mgr.update_dimension_values(col_name, values_nw)
@@ -1048,9 +1051,9 @@ class DatabaseRecoveryManager:
                     if self._table_exists(dim_table):
                         # Ajout des valeurs de fact_table manquantes dans dimension
                         fact_values = self.conn.execute(
-                            f"SELECT DISTINCT {col_name} FROM"
+                            f"SELECT DISTINCT {quote_ident(col_name)} FROM"
                             f" {self._qualified('fact_table')} WHERE"
-                            f" {col_name} IS NOT NULL"
+                            f" {quote_ident(col_name)} IS NOT NULL"
                         ).pl()[col_name]
                         added = dim_mgr.update_dimension_values(col_name, fact_values)
                         if added > 0:
@@ -1563,19 +1566,21 @@ class DatabaseRecoveryManager:
             # Noms qualifiés par le schéma
             fact_table = self._qualified("fact_table")
             dim_table = self._qualified(f"dim_{col_name}")
+            # Identifiant de colonne issu des données : présent plusieurs fois
+            quoted_col = quote_ident(col_name)
 
             if issue.table_name == "fact_table":
                 # Références orphelines dans fact_table → mettre à NULL
                 self.conn.execute(f"""
-                    UPDATE {fact_table} SET {col_name} = NULL
-                    WHERE {col_name} NOT IN (SELECT value FROM {dim_table})
+                    UPDATE {fact_table} SET {quoted_col} = NULL
+                    WHERE {quoted_col} NOT IN (SELECT value FROM {dim_table})
                 """)
             else:
                 # Entrées orphelines dans dimension → supprimer
                 self.conn.execute(f"""
                     DELETE FROM {dim_table}
-                    WHERE value NOT IN (SELECT DISTINCT {col_name} FROM {fact_table}
-                    WHERE {col_name} IS NOT NULL)
+                    WHERE value NOT IN (SELECT DISTINCT {quoted_col} FROM {fact_table}
+                    WHERE {quoted_col} IS NOT NULL)
                 """)
 
             return True
@@ -1609,7 +1614,9 @@ class DatabaseRecoveryManager:
             initial_count = _r1[0] if _r1 is not None else 0
 
             # Suppression des lignes contenant des valeurs nulles
-            self.conn.execute(f"DELETE FROM {fact_table} WHERE {col_name} IS NULL")
+            self.conn.execute(
+                f"DELETE FROM {fact_table} WHERE {quote_ident(col_name)} IS NULL"
+            )
 
             # Comptage des lignes après suppression
             _r2 = self.conn.execute(f"SELECT COUNT(*) FROM {fact_table}").fetchone()
@@ -1712,8 +1719,8 @@ class DatabaseRecoveryManager:
             # update_dimension_values crée la table si elle n'existe pas.
             if "missing" in issue.description.lower():
                 values_pl = self.conn.execute(
-                    f"SELECT DISTINCT {col_name} FROM {fact_table} WHERE {col_name} IS"
-                    f" NOT NULL"
+                    f"SELECT DISTINCT {quote_ident(col_name)} FROM {fact_table}"
+                    f" WHERE {quote_ident(col_name)} IS NOT NULL"
                 ).pl()[col_name]
                 dim_mgr.update_dimension_values(
                     col_name, nw.from_native(values_pl, series_only=True)
@@ -1725,8 +1732,8 @@ class DatabaseRecoveryManager:
             if self._table_exists(dim_name):
                 self.conn.execute(f"DROP TABLE {dim_table}")
                 values_pl = self.conn.execute(
-                    f"SELECT DISTINCT {col_name} FROM {fact_table} WHERE {col_name} IS"
-                    f" NOT NULL"
+                    f"SELECT DISTINCT {quote_ident(col_name)} FROM {fact_table}"
+                    f" WHERE {quote_ident(col_name)} IS NOT NULL"
                 ).pl()[col_name]
                 dim_mgr.update_dimension_values(
                     col_name, nw.from_native(values_pl, series_only=True)

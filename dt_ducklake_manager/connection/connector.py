@@ -1,6 +1,5 @@
 # Importation des modules
 # Modules de base
-import logging
 import os
 from enum import StrEnum
 from pathlib import Path
@@ -11,49 +10,11 @@ import duckdb
 # PostgreSQL
 import psycopg2
 
-# Emplacement du fichier
-FILE_PATH = Path(os.path.abspath(__file__))
+# Module d'initialisation du logger
+from ..utils.logger import _init_logger
 
-
-# Fonction d'initialisation du logger
-def _init_logger(filename: str | os.PathLike[str]) -> logging.Logger:
-    """
-    Initializes the logger for logging to a file.
-
-    Parameters:
-        filename (os.PathLike): Path to the log file.
-
-    Returns:
-        logging.Logger: Initialized logger object.
-
-    Note:
-        This function configures logging to output messages to both console and a file.
-    """
-    # Configuration de logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
-    )
-
-    # Vérification de l'existance du dossier pour le fichier de log
-    log_directory = os.path.dirname(filename)
-
-    if (not os.path.exists(log_directory)) & (log_directory != ""):
-        os.makedirs(log_directory)
-
-    # Configuration du fichier de logs
-    file_handler = logging.FileHandler(filename)
-    file_handler.setLevel(logging.INFO)
-
-    # Set a formatter for the file handler
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    file_handler.setFormatter(formatter)
-
-    # Initialisation du logger
-    logger = logging.getLogger()
-    logger.addHandler(file_handler)
-
-    return logger
+# Nom du logger de ce module (fichier par défaut : <cwd>/logs/ducklake_connector.log)
+_LOGGER_NAME = "ducklake_connector"
 
 
 # Énumération des backends de catalogue supportés par DuckLake
@@ -182,9 +143,7 @@ class DuckLakeConnector:
         s3_access_key_id: str | None = None,
         s3_secret_access_key: str | None = None,
         s3_session_token: str | None = None,
-        log_filename: str | os.PathLike[str] | None = os.path.join(
-            FILE_PATH.parents[2], "logs/ducklake_connector.log"
-        ),
+        log_filename: str | os.PathLike[str] | None = None,
     ) -> None:
         """
         Initialize the DuckLakeConnector.
@@ -357,12 +316,9 @@ class DuckLakeConnector:
         # Conservé à part pour ne jamais être journalisé (il contient le mot de passe).
         self._secret_sql: str | None = None
 
-        # Initialisation du logger
-        if log_filename is None:
-            log_filename = os.path.join(
-                FILE_PATH.parents[2], "logs/ducklake_connector.log"
-            )
-        self.logger = _init_logger(filename=log_filename)
+        # Initialisation du logger nommé.
+        # Chemin par défaut centralisé dans utils.logger : <cwd>/logs/<name>.log.
+        self.logger = _init_logger(filename=log_filename, name=_LOGGER_NAME)
 
     # ---------------------------------------------------------------------------
     # Méthodes publiques de connexion

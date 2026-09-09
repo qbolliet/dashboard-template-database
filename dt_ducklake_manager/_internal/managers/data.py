@@ -9,7 +9,7 @@ import duckdb
 import narwhals as nw
 from narwhals.typing import IntoDataFrame
 
-from ...utils.sql import _build_where_clause
+from ...utils.sql import _build_where_clause, quote_ident
 
 # Import des utilitaires
 from ...utils.types import map_python_to_sql_type
@@ -453,15 +453,16 @@ class DataManager(BaseSchemaManager):
 
             # Ajout de la colonne avec valeur par défaut
             fact_table = self._qualified("fact_table")
+            quoted_column = quote_ident(column_name)
             if default_value is not None:
                 alter_query = (
-                    f"ALTER TABLE {fact_table} ADD COLUMN {column_name}"
+                    f"ALTER TABLE {fact_table} ADD COLUMN {quoted_column}"
                     f" {sql_type} DEFAULT ?"
                 )
                 self.conn.execute(alter_query, [default_value])
             else:
                 alter_query = (
-                    f"ALTER TABLE {fact_table} ADD COLUMN {column_name}"
+                    f"ALTER TABLE {fact_table} ADD COLUMN {quoted_column}"
                     f" {sql_type} DEFAULT NULL"
                 )
                 self.conn.execute(alter_query)
@@ -507,7 +508,8 @@ class DataManager(BaseSchemaManager):
             try:
                 # Suppression de la colonne
                 alter_query = (
-                    f"ALTER TABLE {self._qualified('fact_table')} DROP COLUMN {column}"
+                    f"ALTER TABLE {self._qualified('fact_table')} DROP COLUMN"
+                    f" {quote_ident(column)}"
                 )
                 self.conn.execute(alter_query)
 
@@ -547,8 +549,8 @@ class DataManager(BaseSchemaManager):
 
             # Mise à jour du type
             alter_query = (
-                f"ALTER TABLE {self._qualified('fact_table')} ALTER {column_name}"
-                f" SET DATA TYPE {new_type}"
+                f"ALTER TABLE {self._qualified('fact_table')} ALTER"
+                f" {quote_ident(column_name)} SET DATA TYPE {new_type}"
             )
             self.conn.execute(alter_query)
 
@@ -616,8 +618,9 @@ class DataManager(BaseSchemaManager):
             # Enregistrement d'une vue temporaire (polars natif pour DuckDB)
             self.conn.register("temp_insert", nw.to_native(df))
 
-            # Insertion des données
-            column_list = ", ".join(df.columns)
+            # Insertion des données.
+            # Liste de colonnes issue des données : identifiants entre guillemets.
+            column_list = ", ".join(quote_ident(c) for c in df.columns)
             insert_query = f"""
                 INSERT INTO {self._qualified("fact_table")} ({column_list})
                 SELECT {column_list} FROM temp_insert
@@ -681,8 +684,12 @@ class DataManager(BaseSchemaManager):
             # Nom qualifié de la table des faits
             fact_table = self._qualified("fact_table")
 
-            # Construction des conditions de jointure
-            merge_condition = " AND ".join([f"f.{key} = t.{key}" for key in merge_keys])
+            # Construction des conditions de jointure.
+            # Chaque clé apparaît deux fois (f.<clé> et t.<clé>) : mise entre
+            # guillemets des deux occurrences.
+            merge_condition = " AND ".join(
+                f"f.{quote_ident(key)} = t.{quote_ident(key)}" for key in merge_keys
+            )
 
             # Comptage des mises à jour
             update_count_query = f"""
@@ -706,10 +713,10 @@ class DataManager(BaseSchemaManager):
 
                 if update_columns:
                     # Noms non-qualifiés côté gauche du SET : DuckDB rejette les
-                    # qualificateurs
-                    # de table (f.col) dans la clause SET d'un UPDATE ... FROM.
+                    # qualificateurs de table (f.col) dans la clause SET d'un UPDATE ... FROM.
                     set_clause = ", ".join(
-                        [f"{col} = t.{col}" for col in update_columns]
+                        f"{quote_ident(col)} = t.{quote_ident(col)}"
+                        for col in update_columns
                     )
                     update_query = f"""
                         UPDATE {fact_table} f
@@ -723,7 +730,7 @@ class DataManager(BaseSchemaManager):
             _ic_row = self.conn.execute(f"SELECT COUNT(*) FROM {fact_table}").fetchone()
             initial_count = _ic_row[0] if _ic_row is not None else 0
 
-            column_list = ", ".join(df.columns)
+            column_list = ", ".join(quote_ident(c) for c in df.columns)
             insert_query = f"""
                 INSERT INTO {fact_table} ({column_list})
                 SELECT {column_list} FROM temp_upsert t

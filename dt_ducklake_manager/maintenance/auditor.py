@@ -4,7 +4,6 @@ import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 # DuckDB
@@ -15,10 +14,7 @@ from narwhals.typing import IntoDataFrame
 
 # Import des utilitaires
 from ..utils.logger import _init_logger
-from ..utils.sql import qualify_table
-
-# Emplacement du fichier
-FILE_PATH = Path(os.path.abspath(__file__))
+from ..utils.sql import qualify_table, quote_ident, resolve_catalog
 
 
 # Classe des niveaux de validation sur la base de données
@@ -240,25 +236,28 @@ class DatabaseAuditor:
         # Alias du catalogue DuckLake attaché : conservé au même titre que le schéma.
         self.catalog_alias = catalog_alias
 
-        # Initialisation du logger pour traçabilité des audits
-        if log_filename is None:
-            log_filename = os.path.join(
-                FILE_PATH.parents[2], "logs/database_auditor.log"
-            )
-        self.logger = _init_logger(filename=log_filename)
+        # Alias de catalogue effectif : utilisé pour la qualification uniquement s'il
+        # correspond à une base réellement attachée (None pour les connexions
+        # in-memory des tests).
+        self._catalog = resolve_catalog(self.conn, self.catalog_alias)
 
-    # Méthode de qualification d'un nom de table par le schéma audité
+        # Initialisation du logger nommé pour traçabilité des audits.
+        # Chemin par défaut centralisé dans utils.logger : <cwd>/logs/<name>.log.
+        self.logger = _init_logger(filename=log_filename, name="database_auditor")
+
+    # Méthode de qualification d'un nom de table par le schéma (et le catalogue) audité
     def _qualified(self, table: str) -> str:
-        """Return a table name qualified by the audited schema.
+        """Return a table name qualified by the audited schema and catalog.
 
         Args:
             table: Bare table name (e.g. ``'fact_table'``).
 
         Returns:
-            The ``'<schema>.<table>'`` identifier.
+            The quoted, qualified identifier (catalog-qualified when an alias is
+            actually attached).
         """
-        # Délégation à l'utilitaire central de qualification
-        return qualify_table(table, self.schema)
+        # Délégation à l'utilitaire central de qualification, alias effectif propagé
+        return qualify_table(table, self.schema, self._catalog)
 
     # Méthodes principales de validation
     # Méthode de validation de la base de données
@@ -675,14 +674,16 @@ class DatabaseAuditor:
             # Noms qualifiés par le schéma (dim_table_name est reçu sous forme nue)
             fact_table = self._qualified("fact_table")
             dim_table = self._qualified(dim_table_name)
+            # Identifiant de colonne issu des données : présent plusieurs fois
+            quoted_col = quote_ident(col_name)
 
             # Vérification des valeurs orphelines dans fact_table (ie qui ne sont pas
             # référencées dans la table de dimension)
             orphaned_query = f"""
-                SELECT COUNT(DISTINCT f.{col_name}) as orphaned_count
+                SELECT COUNT(DISTINCT f.{quoted_col}) as orphaned_count
                 FROM {fact_table} f
-                LEFT JOIN {dim_table} d ON f.{col_name} = d.value
-                WHERE f.{col_name} IS NOT NULL AND d.value IS NULL
+                LEFT JOIN {dim_table} d ON f.{quoted_col} = d.value
+                WHERE f.{quoted_col} IS NOT NULL AND d.value IS NULL
             """
 
             result = self.conn.execute(orphaned_query).fetchone()
@@ -706,8 +707,8 @@ class DatabaseAuditor:
             unused_query = f"""
                 SELECT COUNT(*) as unused_count
                 FROM {dim_table} d
-                LEFT JOIN {fact_table} f ON d.value = f.{col_name}
-                WHERE f.{col_name} IS NULL
+                LEFT JOIN {fact_table} f ON d.value = f.{quoted_col}
+                WHERE f.{quoted_col} IS NULL
             """
 
             result = self.conn.execute(unused_query).fetchone()
@@ -819,8 +820,9 @@ class DatabaseAuditor:
 
                 # Comptage des valeurs uniques
                 unique_count_query = (
-                    f"SELECT COUNT(DISTINCT {col_name}) FROM"
-                    f" {self._qualified('fact_table')} WHERE {col_name} IS NOT NULL"
+                    f"SELECT COUNT(DISTINCT {quote_ident(col_name)}) FROM"
+                    f" {self._qualified('fact_table')} WHERE"
+                    f" {quote_ident(col_name)} IS NOT NULL"
                 )
                 result = self.conn.execute(unique_count_query).fetchone()
                 unique_count = result[0] if result else 0
@@ -864,8 +866,9 @@ class DatabaseAuditor:
 
                 # Comptage des valeurs uniques
                 unique_count_query = (
-                    f"SELECT COUNT(DISTINCT {col_name}) FROM"
-                    f" {self._qualified('fact_table')} WHERE {col_name} IS NOT NULL"
+                    f"SELECT COUNT(DISTINCT {quote_ident(col_name)}) FROM"
+                    f" {self._qualified('fact_table')} WHERE"
+                    f" {quote_ident(col_name)} IS NOT NULL"
                 )
                 result = self.conn.execute(unique_count_query).fetchone()
                 unique_count = result[0] if result else 0
@@ -1166,7 +1169,7 @@ class DatabaseAuditor:
                 # colonne
                 null_count_query = (
                     f"SELECT COUNT(*) FROM {self._qualified('fact_table')} "
-                    f"WHERE {col_name} IS NULL"
+                    f"WHERE {quote_ident(col_name)} IS NULL"
                 )
                 # Exécution de la requête
                 _rn = self.conn.execute(null_count_query).fetchone()

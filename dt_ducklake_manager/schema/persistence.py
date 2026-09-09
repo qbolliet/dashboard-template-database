@@ -1,7 +1,6 @@
 # Importation des modules
 # Modules de base
 import os
-from pathlib import Path
 from typing import Literal
 
 # Duckdb
@@ -10,13 +9,15 @@ import narwhals as nw
 from narwhals.typing import IntoDataFrame
 
 # Utilitaires de traitement des données
-from ..utils.sql import qualify_table, remove_dataframe_duplicates
+from ..utils.sql import (
+    qualify_table,
+    quote_ident,
+    remove_dataframe_duplicates,
+    resolve_catalog,
+)
 
 # Modules ad hoc
 from .inference import SchemaBuilder
-
-# Emplacement du fichier
-FILE_PATH = Path(os.path.abspath(__file__))
 
 
 # Classe créant les tables correspondant au schéma dans un catalogue DuckLake
@@ -68,9 +69,7 @@ class DuckLakeTablesBuilder:
         connection: duckdb.DuckDBPyConnection | None = None,
         schema: str = "main",
         catalog_alias: str = "db",
-        log_filename: str | os.PathLike[str] | None = os.path.join(
-            FILE_PATH.parents[2], "logs/ducklake_tables_builder.log"
-        ),
+        log_filename: str | os.PathLike[str] | None = None,
     ):
         """
         Initialize the DuckLakeTablesBuilder.
@@ -129,6 +128,30 @@ class DuckLakeTablesBuilder:
         # afin de pouvoir qualifier les tables par le catalogue.
         self.catalog_alias = catalog_alias
 
+        # Alias de catalogue effectif : utilisé pour la qualification uniquement s'il
+        # correspond à une base réellement attachée (None pour les connexions
+        # in-memory des tests).
+        self._catalog = resolve_catalog(self.conn, self.catalog_alias)
+
+    # Méthode de qualification d'un nom de table par le schéma (et le catalogue) cible
+    def _qualified(self, table: str) -> str:
+        """
+        Return a table name qualified by the target schema and catalog.
+
+        Args:
+            table (str): Bare table name (e.g. ``'fact_table'``).
+
+        Returns:
+            str: The quoted, qualified identifier (catalog-qualified only when an
+            alias is actually attached).
+
+        Examples:
+            >>> builder._qualified("fact_table")
+            '"main"."fact_table"'
+        """
+        # Propagation de l'alias de catalogue effectif à l'utilitaire central
+        return qualify_table(table, self.schema, self._catalog)
+
     # Méthode de création de la table des méta-données
     def create_duckdb_metadata_table(
         self,
@@ -160,8 +183,8 @@ class DuckLakeTablesBuilder:
         # (ex. après un .sort()). On filtre explicitement sur les colonnes nommées du
         # DataFrame.
         df_meta = self.schema_builder.df_metadata
-        # Nom qualifié par le schéma cible
-        qualified_name = qualify_table(table_name or "metadata", self.schema)
+        # Nom qualifié par le schéma (et le catalogue) cible
+        qualified_name = self._qualified(table_name or "metadata")
         self.conn.register(
             "temp_metadata", df_meta.to_arrow().select(list(df_meta.columns))
         )
@@ -209,7 +232,7 @@ class DuckLakeTablesBuilder:
         # Création de chaque table de dimension dans DuckDB
         for dim_name, dim_df in self.schema_builder.dimension_tables.items():
             # Initialisation du nom de la table, qualifié par le schéma cible
-            table_name = qualify_table(f"{table_prefix}{dim_name}", self.schema)
+            table_name = self._qualified(f"{table_prefix}{dim_name}")
             # Conversion vers Arrow pour garantir la compatibilité DuckDB quel que soit
             # le backend narwhals.
             # Note : .select() filtre l'index pandas éventuel (cf.
@@ -277,8 +300,8 @@ class DuckLakeTablesBuilder:
         df_metadata = self.schema_builder.df_metadata
         primary_keys = self.schema_builder.primary_keys
 
-        # Nom qualifié de la table des faits par le schéma cible
-        qualified_name = qualify_table(table_name or "fact_table", self.schema)
+        # Nom qualifié de la table des faits par le schéma (et le catalogue) cible
+        qualified_name = self._qualified(table_name or "fact_table")
 
         # Conversion vers Arrow pour garantir la compatibilité DuckDB quel que soit le
         # backend narwhals.
@@ -303,7 +326,7 @@ class DuckLakeTablesBuilder:
                 if len(matching_rows) > 0:
                     # Extraction du type SQL via accès positionnel à la Series
                     sql_type = matching_rows.get_column("sql_type")[0]
-                    column_definitions.append(f"{col} {sql_type}")
+                    column_definitions.append(f"{quote_ident(col)} {sql_type}")
 
             # Création de la table avec DDL explicite
             query = f"""
@@ -328,10 +351,12 @@ class DuckLakeTablesBuilder:
                     f" the following dimensions : ({partition_by})"
                 )
 
-            # Insertion des données depuis la vue temporaire
+            # Insertion des données depuis la vue temporaire.
+            # Liste de colonnes issue des données : identifiants entre guillemets.
+            fact_columns_sql = ", ".join(quote_ident(c) for c in df_fact.columns)
             self.conn.execute(f"""
                 INSERT INTO {qualified_name}
-                SELECT {", ".join(df_fact.columns)}
+                SELECT {fact_columns_sql}
                 FROM temp_fact
             """)
 
@@ -345,9 +370,10 @@ class DuckLakeTablesBuilder:
         else:
             # Chemin CTAS (sans partition ni clés primaires) : plus performant, pas de
             # DDL intermédiaire
+            fact_columns_sql = ", ".join(quote_ident(c) for c in df_fact.columns)
             query = f"""
                 CREATE TABLE {qualified_name} AS
-                SELECT {", ".join(df_fact.columns)}
+                SELECT {fact_columns_sql}
                 FROM temp_fact
             """
             self.conn.execute(query)
@@ -356,11 +382,12 @@ class DuckLakeTablesBuilder:
         self.conn.execute("DROP VIEW temp_fact")
 
         # Logging des clés étrangères créées (pour information)
-        dim_prefix = qualify_table(table_prefix or "dim_", self.schema)
+        prefix = table_prefix or "dim_"
         for dim_name in self.schema_builder.dimension_tables.keys():
+            dim_table = self._qualified(f"{prefix}{dim_name}")
             self.logger.info(
                 f"Foreign key created for dimension '{dim_name}' - can be joined on"
-                f" {qualified_name}.{dim_name} = {dim_prefix}{dim_name}.value"
+                f" {qualified_name}.{quote_ident(dim_name)} = {dim_table}.value"
             )
 
         # Logging
@@ -402,11 +429,14 @@ class DuckLakeTablesBuilder:
             >>> builder.build_schema()
             >>> builder.build_schema(partition_by=['country'])
         """
-        # Création défensive du schéma cible s'il n'existe pas encore.
+        # Création du schéma cible s'il n'existe pas encore.
         # Utile lorsque la connexion n'a pas été préparée par DuckLakeConnector
         # (ex. connexion in-memory de test) ou pour ajouter un nouveau schéma à un
         # catalogue existant. CREATE SCHEMA IF NOT EXISTS est idempotent.
-        self.conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema}")
+        schema_ref = quote_ident(self.schema)
+        if self._catalog is not None:
+            schema_ref = f"{quote_ident(self._catalog)}.{schema_ref}"
+        self.conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_ref}")
 
         # Vérification et suppression des doublons sur le DataFrame du SchemaBuilder.
         # Les clés primaires sont transmises à la fonction de déduplication afin que
@@ -479,7 +509,7 @@ class DuckLakeTablesBuilder:
             self.logger.info(f"\n {table[0]} Structure:")
             # Extraction des informations relatives à la table (qualifiée)
             table_info = self.conn.execute(
-                f"DESCRIBE {qualify_table(table[0], self.schema)}"
+                f"DESCRIBE {self._qualified(table[0])}"
             ).fetchall()
             # Affichage de chaque information
             for col in table_info:

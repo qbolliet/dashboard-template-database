@@ -2,7 +2,6 @@
 # Modules de base
 import os
 import warnings
-from pathlib import Path
 from typing import Any
 
 import narwhals as nw
@@ -13,9 +12,6 @@ from ..utils.logger import _init_logger
 
 # Utilitaires de traitement des données
 from ..utils.types import map_python_to_sql_type
-
-# Emplacement du fichier
-FILE_PATH = Path(os.path.abspath(__file__))
 
 
 # Classe de création d'une base de données DuckDB avec :
@@ -117,10 +113,9 @@ class SchemaBuilder:
                 stacklevel=2,
             )
 
-        # Initialisation du logger
-        if log_filename is None:
-            log_filename = os.path.join(FILE_PATH.parents[2], "logs/schema_builder.log")
-        self.logger = _init_logger(filename=log_filename)
+        # Initialisation du logger nommé.
+        # Chemin par défaut centralisé dans utils.logger : <cwd>/logs/<name>.log.
+        self.logger = _init_logger(filename=log_filename, name="schema_builder")
 
         # Logging de la validation des clés primaires (après initialisation du logger)
         if len(self.primary_keys) > 0:
