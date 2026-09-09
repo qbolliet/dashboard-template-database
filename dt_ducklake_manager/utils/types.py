@@ -7,6 +7,10 @@ def map_python_to_sql_type(dtype: nw.dtypes.DType) -> str:
     """
     Map Narwhals data types to SQL-compatible data types.
 
+    Integer and float widths are preserved: the package never silently narrows a
+    column. It is up to the producer to supply a ``Float32`` (or a narrower integer)
+    when 32 bits are deemed sufficient.
+
     Args:
         dtype (nw.DType): The Narwhals data type.
 
@@ -19,10 +23,10 @@ def map_python_to_sql_type(dtype: nw.dtypes.DType) -> str:
         >>> df = pl.DataFrame({'col': ['a', 'b']})
         >>> map_python_to_sql_type(df.schema['col'])
         'VARCHAR'
-        >>> df = pl.DataFrame({'col': [1, 2]})
+        >>> df = pl.DataFrame({'col': [1, 2]})  # polars infère Int64
         >>> map_python_to_sql_type(df.schema['col'])
-        'INTEGER'
-        >>> df = pl.DataFrame({'col': [1.0, 2.0]})
+        'BIGINT'
+        >>> df = pl.DataFrame({'col': [1.0, 2.0]})  # polars infère Float64
         >>> map_python_to_sql_type(df.schema['col'])
         'DOUBLE'
     """
@@ -32,10 +36,16 @@ def map_python_to_sql_type(dtype: nw.dtypes.DType) -> str:
         return "VARCHAR"
 
     # Entiers signés
-    # Int8 / Int16 / Int32 / Int64 correspondent à INTEGER standard
-    # Int128 est mappé vers HUGEINT, le type entier 128 bits natif de DuckDB
-    elif isinstance(dtype, (nw.Int8, nw.Int16, nw.Int32, nw.Int64)):
+    # Préservation de la largeur : chaque type narwhals conserve son type SQL dédié.
+    # Int128 est mappé vers HUGEINT, le type entier 128 bits natif de DuckDB.
+    elif isinstance(dtype, nw.Int8):
+        return "TINYINT"
+    elif isinstance(dtype, nw.Int16):
+        return "SMALLINT"
+    elif isinstance(dtype, nw.Int32):
         return "INTEGER"
+    elif isinstance(dtype, nw.Int64):
+        return "BIGINT"
     elif isinstance(dtype, nw.Int128):
         return "HUGEINT"
 
@@ -53,7 +63,10 @@ def map_python_to_sql_type(dtype: nw.dtypes.DType) -> str:
         return "UHUGEINT"
 
     # Types virgule flottante
-    elif isinstance(dtype, (nw.Float32, nw.Float64)):
+    # Préservation de la largeur : Float32 → FLOAT (32 bits), Float64 → DOUBLE (64 bits)
+    elif isinstance(dtype, nw.Float32):
+        return "FLOAT"
+    elif isinstance(dtype, nw.Float64):
         return "DOUBLE"
 
     # Type décimal à précision fixe
