@@ -338,7 +338,7 @@ class AtomicDatabaseOperations:
                 operations_performed=[
                     f"Updated {len(_update_nw)} rows",
                     "Metadata updated",
-                    "Dimensions updated",
+                    "Categorical flags refreshed",
                     "Fact table updated",
                 ],
                 metrics={
@@ -531,7 +531,6 @@ class AtomicDatabaseOperations:
 
         Example:
             >>> cleanup_config = {
-            ...     'remove_orphaned_dimensions': True,
             ...     'remove_null_columns': True,
             ...     'filters': "status = 'deleted'"  # Remove specific rows
             ... }

@@ -107,39 +107,66 @@ def test_create_duckdb_metadata_table(ducklake_builder: DuckLakeTablesBuilder) -
     result = ducklake_builder.conn.execute("SELECT * FROM test_metadata").pl()
     assert "name" in result.columns
     assert "label" in result.columns
-    assert "python_type" in result.columns
+    assert "is_categorical_forced" in result.columns
     assert "sql_type" in result.columns
     assert "is_categorical" in result.columns
 
 
 # ---------------------------------------------------------------------------
-# Tests de create_duckdb_dimension_tables()
+# Tests de create_duckdb_dataset_metadata_table()
 # ---------------------------------------------------------------------------
 
 
-# Test de la création des tables de dimension dans DuckDB
-def test_create_duckdb_dimension_tables(
+# Test de la création de la table des méta-données du jeu de résultats
+def test_create_duckdb_dataset_metadata_table(
     ducklake_builder: DuckLakeTablesBuilder,
 ) -> None:
-    """Test the build of the dimension tables in DuckDB.
+    """Test the build of the single-row dataset_metadata table.
 
     Args:
         ducklake_builder: DuckLakeTablesBuilder fixture.
     """
-    # Création des tables de dimensions
-    ducklake_builder.create_duckdb_dimension_tables(table_prefix="test_dim_")
+    # Création de la table descriptive du jeu de résultats
+    ducklake_builder.create_duckdb_dataset_metadata_table()
 
-    # Vérification que les tables attendues existent
-    tables = ducklake_builder.conn.execute("SHOW TABLES").fetchall()
-    table_names = [t[0] for t in tables]
-    assert "test_dim_category" in table_names
-    assert "test_dim_status" in table_names
+    result = ducklake_builder.conn.execute("SELECT * FROM dataset_metadata").pl()
 
-    # Vérification de la structure des tables de dimension
-    for table in ["category", "status"]:
-        result = ducklake_builder.conn.execute(f"SELECT * FROM test_dim_{table}").pl()
-        assert "value" in result.columns
-        assert "label" in result.columns
+    # Une seule ligne par schéma
+    assert result.shape[0] == 1
+    # Champs systématiquement renseignés
+    assert result["schema_version"][0] == 1
+    assert result["updated_at"][0] is not None
+    # cluster_by reste NULL à ce stade
+    assert result["cluster_by"][0] is None
+    # Champs descriptifs non fournis par le builder de test
+    assert result["label"][0] is None
+
+
+# Test de la propagation des champs descriptifs du jeu de résultats
+def test_dataset_metadata_carries_builder_arguments(
+    sample_df: pl.DataFrame,
+) -> None:
+    """Test that the optional dataset arguments reach dataset_metadata.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        builder = DuckLakeTablesBuilder(
+            sample_df,
+            categorical_threshold=4,
+            primary_keys=["id"],
+            dataset_label="Prédictions",
+            dataset_description="Sorties du modèle",
+            dataset_source="pipeline-ml",
+        )
+    builder.create_duckdb_dataset_metadata_table()
+
+    result = builder.conn.execute("SELECT * FROM dataset_metadata").pl()
+    assert result["label"][0] == "Prédictions"
+    assert result["description"][0] == "Sorties du modèle"
+    assert result["source"][0] == "pipeline-ml"
 
 
 # ---------------------------------------------------------------------------
@@ -160,26 +187,18 @@ def test_create_duckdb_fact_table(
     """
     # Création des tables nécessaires en amont
     ducklake_builder.create_duckdb_metadata_table()
-    ducklake_builder.create_duckdb_dimension_tables()
     # Création de la table des faits
     ducklake_builder.create_duckdb_fact_table(table_name="test_fact")
 
-    # Vérification que la table des faits existe et a les bonnes dimensions
+    # Vérification que la table des faits existe et a la bonne forme
     result = ducklake_builder.conn.execute("SELECT * FROM test_fact").pl()
     assert result.shape[0] == len(sample_df)
     assert "category" in result.columns
     assert "status" in result.columns
 
-    # Vérification que les valeurs de la fact table
-    # sont des indices entiers de la dim table
-    dim_category = ducklake_builder.conn.execute("SELECT * FROM dim_category").pl()
-    dim_status = ducklake_builder.conn.execute("SELECT * FROM dim_status").pl()
-    assert set(result["category"].to_list()) <= set(
-        dim_category["value"].cast(pl.Int64).to_list()
-    )
-    assert set(result["status"].to_list()) <= set(
-        dim_status["value"].cast(pl.Int64).to_list()
-    )
+    # Vérification que les colonnes catégorielles portent les libellés d'origine
+    assert result["category"].to_list() == sample_df["category"].to_list()
+    assert result["status"].to_list() == sample_df["status"].to_list()
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +208,7 @@ def test_create_duckdb_fact_table(
 
 # Test de la construction de l'ensemble du schéma
 def test_build_schema(ducklake_builder: DuckLakeTablesBuilder) -> None:
-    """Test the build of the complete schema (metadata, dimensions, fact table).
+    """Test the build of the complete schema (metadata, fact, dataset_metadata).
 
     Args:
         ducklake_builder: DuckLakeTablesBuilder fixture.
@@ -198,16 +217,16 @@ def test_build_schema(ducklake_builder: DuckLakeTablesBuilder) -> None:
     ducklake_builder.build_schema(
         metadata_table="test_metadata",
         fact_table="test_fact",
-        dim_table_prefix="test_dim_",
+        dataset_metadata_table="test_dataset_metadata",
     )
 
-    # Vérification que toutes les tables attendues ont été créées
+    # Vérification que les trois tables attendues ont été créées, et elles seules
     tables = ducklake_builder.conn.execute("SHOW TABLES").fetchall()
     table_names = [t[0] for t in tables]
     assert "test_metadata" in table_names
     assert "test_fact" in table_names
-    assert "test_dim_category" in table_names
-    assert "test_dim_status" in table_names
+    assert "test_dataset_metadata" in table_names
+    assert not [name for name in table_names if name.startswith("dim_")]
 
 
 # Test de l'affichage du schéma construit
@@ -397,9 +416,11 @@ def test_duplicate_check_uses_primary_keys(sample_df: pl.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 
-# Test que categorical_threshold=None ne crée aucune table de dimension
-def test_categorical_threshold_none_no_dim_tables(sample_df: pl.DataFrame) -> None:
-    """Test that no dimension tables are created when categorical_threshold=None.
+# Test que categorical_threshold=None n'altère pas les tables construites
+def test_categorical_threshold_none_builds_three_tables(
+    sample_df: pl.DataFrame,
+) -> None:
+    """Test that the schema still holds exactly three tables without a threshold.
 
     Args:
         sample_df: Sample polars DataFrame.
@@ -411,11 +432,9 @@ def test_categorical_threshold_none_no_dim_tables(sample_df: pl.DataFrame) -> No
     builder.build_schema()
 
     # Récupération des tables créées
-    tables = [row[0] for row in builder.conn.execute("SHOW TABLES").fetchall()]
+    tables = {row[0] for row in builder.conn.execute("SHOW TABLES").fetchall()}
 
-    # Aucune table de dimension (préfixe 'dim_') ne doit exister
-    dim_tables = [t for t in tables if t.startswith("dim_")]
-    assert len(dim_tables) == 0
+    assert tables == {"fact_table", "metadata", "dataset_metadata"}
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +509,6 @@ def test_create_duckdb_fact_table_with_partition_by(sample_df: pl.DataFrame) -> 
             )
 
         builder.create_duckdb_metadata_table()
-        builder.create_duckdb_dimension_tables()
         # Vérification que partition_by est accepté sans erreur
         builder.create_duckdb_fact_table(partition_by=["category"])
 
@@ -533,7 +551,7 @@ def test_build_schema_with_partition_by(sample_df: pl.DataFrame) -> None:
         tables = [row[0] for row in conn.execute("SHOW TABLES").fetchall()]
         assert "metadata" in tables
         assert "fact_table" in tables
-        assert "dim_category" in tables
+        assert "dataset_metadata" in tables
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +617,7 @@ def test_two_schemas_coexist_in_one_catalog(
     for schema_name in ("predictions", "shapley"):
         assert "fact_table" in tables_by_schema[schema_name]
         assert "metadata" in tables_by_schema[schema_name]
-        assert "dim_category" in tables_by_schema[schema_name]
+        assert "dataset_metadata" in tables_by_schema[schema_name]
 
     # Les comptages sont propres à chaque schéma (3 vs 2 lignes)
     pred_row = multi_schema_connection.execute(

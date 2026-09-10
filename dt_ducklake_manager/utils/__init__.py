@@ -7,7 +7,7 @@ from .sql import (
     remove_dataframe_duplicates,
     resolve_catalog,
 )
-from .types import map_python_to_sql_type
+from .types import map_python_to_sql_type, resolve_sql_type_conflict
 
 # Exportation au niveau du module
 __all__ = [
@@ -18,4 +18,5 @@ __all__ = [
     "quote_ident",
     "resolve_catalog",
     "map_python_to_sql_type",
+    "resolve_sql_type_conflict",
 ]

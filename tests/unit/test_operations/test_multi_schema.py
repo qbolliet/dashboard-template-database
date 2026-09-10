@@ -150,7 +150,6 @@ def test_catalog_alias_travels_with_schema(
     # Le schéma et l'alias voyagent ensemble jusqu'aux sous-gestionnaires
     for mgr in (
         updater,
-        updater.dimension_mgr,
         updater.data_mgr,
         updater.transaction_mgr,
         updater.auditor,

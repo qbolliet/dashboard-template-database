@@ -48,7 +48,6 @@ def test_deleter_propagates_catalog_alias(built_ducklake_schema: Any) -> None:
         connection=built_ducklake_schema, catalog_alias="my_lake"
     )
     assert deleter.catalog_alias == "my_lake"
-    assert deleter.dimension_mgr.catalog_alias == "my_lake"
     assert deleter.data_mgr.catalog_alias == "my_lake"
     assert deleter.transaction_mgr.catalog_alias == "my_lake"
     assert deleter.auditor is not None
@@ -226,9 +225,8 @@ def test_delete_rows_non_categorical_becomes_categorical(
     'high_cardinality'
     initially holds 5 unique values (val_100..val_104) and is NOT categorical. The row
     with id=5 carries the only occurrence of 'val_104'. Deleting that row leaves exactly
-    4 distinct values (val_100..val_103) which equals the threshold, triggering
-    conversion
-    to categorical and creation of dim_high_cardinality.
+    4 distinct values (val_100..val_103) which equals the threshold, flipping the
+    metadata flag. The fact table itself is never rewritten.
 
     Args:
         deleter: DatabaseDeleter fixture with auto_cleanup=True.
@@ -241,19 +239,11 @@ def test_delete_rows_non_categorical_becomes_categorical(
     ).fetchone()[0]
     assert is_cat_before is False
 
-    # Vérification initiale : la table de dimension dim_high_cardinality n'existe pas
-    # encore
-    tables_before = [
-        row[0] for row in built_ducklake_schema.execute("SHOW TABLES").fetchall()
-    ]
-    assert "dim_high_cardinality" not in tables_before
-
     # Suppression de la ligne id=5 (seul porteur de 'val_104') :
     # après suppression, high_cardinality n'aura plus que 4 valeurs uniques
     # (val_100..val_103)
-    # ce qui est ≤ seuil=4 → conversion en variable catégorielle déclenchée par le
-    # nettoyage
-    # automatique (_detect_new_categorical_after_deletion via
+    # ce qui est ≤ seuil=4 → bascule du booléen is_categorical déclenchée par le
+    # nettoyage automatique (_refresh_categorical_flags via
     # _cleanup_orphaned_data_comprehensive).
     deleted_count = deleter.delete_rows(
         filters=[("id", "=", 5)],
@@ -267,8 +257,11 @@ def test_delete_rows_non_categorical_becomes_categorical(
     ).fetchone()[0]
     assert is_cat_after is True
 
-    # Vérification : la table de dimension dim_high_cardinality a bien été créée
-    tables_after = [
-        row[0] for row in built_ducklake_schema.execute("SHOW TABLES").fetchall()
-    ]
-    assert "dim_high_cardinality" in tables_after
+    # Vérification : les libellés d'origine sont toujours stockés tels quels
+    stored_labels = {
+        row[0]
+        for row in built_ducklake_schema.execute(
+            "SELECT DISTINCT high_cardinality FROM fact_table"
+        ).fetchall()
+    }
+    assert stored_labels == {"val_100", "val_101", "val_102", "val_103"}

@@ -14,7 +14,7 @@ This package provides a complete lifecycle for a DuckLake database:
 - **Audit & validate** database integrity at configurable levels
 - **Maintain** physical storage (file compaction, snapshot expiry)
 
-The schema is built around a **fact table**, a **metadata table**, and **dimension tables** for low-cardinality categorical columns.
+The schema is built around three tables per result set: a **fact table** holding the observations (categorical columns store their original labels — there are no dimension tables), a **metadata table** describing every column (label, SQL type, categorical and primary-key flags), and a **dataset metadata table** describing the result set itself (title, description, source, last update, schema version).
 
 Input dataframes are handled via [narwhals](https://narwhals-dev.github.io/narwhals/), making the package compatible with pandas, polars, and any other narwhals-supported backend.
 
@@ -41,33 +41,44 @@ from dt_ducklake_manager.schema import DuckLakeTablesBuilder
 from dt_ducklake_manager.operations import DatabaseUpdater, DatabaseDeleter
 from dt_ducklake_manager.maintenance import DatabaseAuditor, DuckLakeMaintenance, ValidationLevel
 
+# 0. Open a connection attached to the DuckLake catalog
+connection = DuckLakeConnector(
+    catalog_path="outputs/catalog.ducklake",
+    data_path="outputs/data/",
+).connect()
+
 # 1. Build the schema from an initial dataset
 df = pd.DataFrame({
     "id": [1, 2, 3],
     "city": ["Paris", "Berlin", "Madrid"],
     "score": [0.9, 0.7, 0.5],
 })
-connector = DuckLakeConnector(catalog_path="outputs/database.db")
-builder = DuckLakeTablesBuilder(connector=connector, df=df, categorical_threshold=200)
+builder = DuckLakeTablesBuilder(
+    df,
+    categorical_threshold=200,
+    primary_keys=["id"],
+    connection=connection,
+    dataset_label="City scores",
+)
 builder.build_schema()
 
 # 2. Update the database with new observations (upsert)
 df_new = pd.DataFrame({"id": [2, 4], "city": ["Lyon", "Rome"], "score": [0.8, 0.6]})
-updater = DatabaseUpdater(connector=connector)
-updater.update_database(df=df_new)
+updater = DatabaseUpdater(connection=connection)
+updater.update_database(update_df=df_new)
 
 # 3. Delete rows matching a condition
-deleter = DatabaseDeleter(connector=connector)
-deleter.delete_rows(conditions=[("score", "<", 0.6)])
+deleter = DatabaseDeleter(connection=connection)
+deleter.delete_rows(filters=[("score", "<", 0.6)])
 
 # 4. Audit database integrity
-auditor = DatabaseAuditor(connector=connector)
-report = auditor.validate_database(level=ValidationLevel.STANDARD)
-print(report)
+auditor = DatabaseAuditor(connection=connection)
+report = auditor.validate_database(ValidationLevel.STANDARD)
+print(report.recommendations)
 
 # 5. Run full maintenance (compaction, snapshot expiry)
-maintenance = DuckLakeMaintenance(connector=connector)
-maintenance.full_maintenance()
+maintenance = DuckLakeMaintenance(connection)
+maintenance.full_maintenance("main", "fact_table")
 ```
 
 More detailed examples and parametrization walkthroughs are available in the `notebooks/` folder.

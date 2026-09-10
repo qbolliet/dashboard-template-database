@@ -84,10 +84,11 @@ class DuckLakeConnector:
 
     A single catalog can host **several schemas** (one per result set, e.g.
     ``predictions`` and ``shapley``), each carrying its own ``fact_table``,
-    ``metadata`` and ``dim_*`` tables. The ``schema`` argument selects which one this
-    connection activates; ``connect()`` creates it if needed (writable connections
-    only). Builders and managers also accept a ``schema`` argument, so a single shared
-    connection can drive several schemas of the same catalog.
+    ``metadata`` and ``dataset_metadata`` tables. The ``schema`` argument selects
+    which one this connection activates; ``connect()`` creates it if needed
+    (writable connections only). Builders and managers also accept a ``schema``
+    argument, so a single shared connection can drive several schemas of the same
+    catalog.
 
     After calling ``connect()``, the returned ``duckdb.DuckDBPyConnection`` can be
     passed directly to ``DuckLakeTablesBuilder``, ``DatabaseUpdater``, or any other

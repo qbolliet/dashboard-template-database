@@ -1,6 +1,7 @@
 # Importation des modules
 # Modules de base
 import os
+from datetime import datetime
 from typing import Literal
 
 # Duckdb
@@ -19,20 +20,26 @@ from ..utils.sql import (
 # Modules ad hoc
 from .inference import SchemaBuilder
 
+# Version du schéma de base de données écrite dans dataset_metadata.
+# Ce champ n'existe que pour permettre une évolution future.
+SCHEMA_VERSION: int = 1
+
 
 # Classe créant les tables correspondant au schéma dans un catalogue DuckLake
 class DuckLakeTablesBuilder:
     """
-    Builds and writes the database schema (metadata, dimension, and fact tables)
-    into a DuckLake catalog.
+    Builds and writes the database schema into a DuckLake catalog.
 
-    This class uses a ``SchemaBuilder`` instance (composition) to infer the three
-    table layers of the dashboard database schema, then writes them directly into
-    the DuckLake catalog attached to the provided connection:
+    This class uses a ``SchemaBuilder`` instance (composition) to infer the schema,
+    then writes exactly three tables into the DuckLake catalog attached to the
+    provided connection:
 
-    - ``metadata`` : column descriptors (type, label, categorical flag, primary key).
-    - ``dim_<col>`` : dimension tables for low-cardinality categorical columns.
-    - ``fact_table`` : the main fact table, optionally Hive-partitioned.
+    - ``fact_table`` : the observations, optionally Hive-partitioned. Categorical
+      columns hold their **original labels** — there is no dimension table and no
+      synthetic code anywhere in the schema.
+    - ``metadata`` : one row per fact table column (label, SQL type, categorical
+      and primary-key flags).
+    - ``dataset_metadata`` : exactly one row describing the result set itself.
 
     The connection must be obtained from ``DuckLakeConnector.connect()`` before
     instantiating this class.
@@ -48,6 +55,11 @@ class DuckLakeTablesBuilder:
         schema (str): DuckLake schema into which the tables are written.
         catalog_alias (str): Alias of the attached DuckLake catalog, carried
             alongside ``schema``.
+        dataset_label (str | None): Title of the result set, written to
+            ``dataset_metadata``.
+        dataset_description (str | None): Description of the result set.
+        dataset_source (str | None): Provenance of the result set (model,
+            pipeline).
         logger (logging.Logger): Logger shared with the SchemaBuilder.
 
     Examples:
@@ -66,9 +78,13 @@ class DuckLakeTablesBuilder:
         df: IntoDataFrame,
         categorical_threshold: int | None = None,
         primary_keys: list[str] | None = None,
+        categorical_overrides: dict[str, bool] | None = None,
         connection: duckdb.DuckDBPyConnection | None = None,
         schema: str = "main",
         catalog_alias: str = "db",
+        dataset_label: str | None = None,
+        dataset_description: str | None = None,
+        dataset_source: str | None = None,
         log_filename: str | os.PathLike[str] | None = None,
     ):
         """
@@ -82,16 +98,24 @@ class DuckLakeTablesBuilder:
                 ``SchemaBuilder`` default).
             primary_keys (Optional[List[str]]): Column names used as logical primary
                 keys (enforced applicatively, not as DDL constraints). Defaults to None.
+            categorical_overrides (Optional[Dict[str, bool]]): Per-column forcing of
+                the categorical status, independent of the threshold. A forced column
+                is never re-evaluated by a later update. Defaults to None.
             connection (Optional[duckdb.DuckDBPyConnection]): DuckLake-attached DuckDB
                 connection obtained from ``DuckLakeConnector.connect()``. If None, an
                 in-memory DuckDB connection is used (for unit tests only).
-            schema (str): DuckLake schema into which the metadata, dimension and fact
-                tables are written. A single catalog can host several schemas.
-                Defaults to ``'main'``.
+            schema (str): DuckLake schema into which the three tables are written. A
+                single catalog can host several schemas. Defaults to ``'main'``.
             catalog_alias (str): Alias of the attached DuckLake catalog, matching
                 the one passed to ``DuckLakeConnector``. Carried alongside
                 ``schema`` so table references can be qualified by the catalog.
                 Defaults to ``'db'``.
+            dataset_label (Optional[str]): Title of the result set, written to
+                ``dataset_metadata.label``. Defaults to None.
+            dataset_description (Optional[str]): Description of the result set.
+                Defaults to None.
+            dataset_source (Optional[str]): Provenance of the result set (model,
+                pipeline). Defaults to None.
             log_filename (Optional[os.PathLike]): Path to the log file.
 
         Examples:
@@ -109,6 +133,7 @@ class DuckLakeTablesBuilder:
             df=df,
             categorical_threshold=categorical_threshold,
             primary_keys=primary_keys,
+            categorical_overrides=categorical_overrides,
             log_filename=log_filename,
         )
 
@@ -132,6 +157,12 @@ class DuckLakeTablesBuilder:
         # correspond à une base réellement attachée (None pour les connexions
         # in-memory des tests).
         self._catalog = resolve_catalog(self.conn, self.catalog_alias)
+
+        # Métadonnées descriptives du jeu de résultats, écrites dans
+        # dataset_metadata à la construction du schéma
+        self.dataset_label = dataset_label
+        self.dataset_description = dataset_description
+        self.dataset_source = dataset_source
 
     # Méthode de qualification d'un nom de table par le schéma (et le catalogue) cible
     def _qualified(self, table: str) -> str:
@@ -159,7 +190,7 @@ class DuckLakeTablesBuilder:
         column_labels: dict[str, str] | None = None,
     ) -> None:
         """
-        Create a metadata table in DuckDB.
+        Create the metadata table in DuckDB, one row per fact table column.
 
         Args:
             table_name (Optional[str]): Name of the metadata table in DuckDB. Defaults
@@ -167,6 +198,9 @@ class DuckLakeTablesBuilder:
             column_labels (Optional[Dict[str, str]]): Optional mapping of column names
                 to labels.
 
+        Examples:
+            >>> builder.create_duckdb_metadata_table()
+            >>> builder.create_duckdb_metadata_table(table_name='column_metadata')
         """
         # Création de la table des méta-données si elle n'existe pas déjà
         if not hasattr(self.schema_builder, "df_metadata"):
@@ -192,85 +226,33 @@ class DuckLakeTablesBuilder:
             CREATE TABLE {qualified_name} (
                 name VARCHAR,
                 label VARCHAR,
-                python_type VARCHAR,
                 sql_type VARCHAR,
                 is_categorical BOOLEAN,
+                is_categorical_forced BOOLEAN,
                 is_primary_key BOOLEAN
             )
         """)
 
-        # Insertion des données depuis la vue temporaire
+        # Insertion des données depuis la vue temporaire.
+        # Liste de colonnes explicite : l'ordre du DataFrame inféré ne doit pas avoir
+        # à coïncider avec celui du DDL.
         self.conn.execute(f"""
             INSERT INTO {qualified_name}
-            SELECT * FROM temp_metadata
+                (name, label, sql_type, is_categorical, is_categorical_forced,
+                 is_primary_key)
+            SELECT name, label, sql_type, is_categorical, is_categorical_forced,
+                   is_primary_key
+            FROM temp_metadata
         """)
         self.conn.execute("DROP VIEW temp_metadata")
 
         # Logging
         self.logger.info("Successfully registered duckdb meta-data table")
 
-    # Méthode de création des tables de dimensions
-    def create_duckdb_dimension_tables(
-        self,
-        table_prefix: str | None = "dim_",
-        column_labels: dict[str, str] | None = None,
-    ) -> None:
-        """
-        Create dimension tables in DuckDB for categorical variables.
-
-        Args:
-            table_prefix (Optional[str]): Prefix for dimension table names. Defaults to
-                'dim_'.
-            column_labels (Optional[Dict[str, str]]): Optional mapping of column names
-                to labels.
-
-        """
-        # Création du dictionnaire des tables de dimensions si elles n'existent pas déjà
-        if not hasattr(self.schema_builder, "dimension_tables"):
-            _ = self.schema_builder.create_dimension_tables(column_labels)
-
-        # Création de chaque table de dimension dans DuckDB
-        for dim_name, dim_df in self.schema_builder.dimension_tables.items():
-            # Initialisation du nom de la table, qualifié par le schéma cible
-            table_name = self._qualified(f"{table_prefix}{dim_name}")
-            # Conversion vers Arrow pour garantir la compatibilité DuckDB quel que soit
-            # le backend narwhals.
-            # Note : .select() filtre l'index pandas éventuel (cf.
-            # create_duckdb_metadata_table).
-            self.conn.register(
-                "temp_dim", dim_df.to_arrow().select(list(dim_df.columns))
-            )
-
-            # Création d'une table avec schéma explicite.
-            # Pas de contrainte PRIMARY KEY : DuckLake ne supporte pas les contraintes
-            # DDL.
-            # L'unicité de 'value' est garantie applicativement par DimensionManager.
-            self.conn.execute(f"""
-                CREATE TABLE {table_name} (
-                    value VARCHAR,
-                    label VARCHAR
-                )
-            """)
-
-            # Insertion des données depuis la vue temporaire
-            self.conn.execute(f"""
-                INSERT INTO {table_name}
-                SELECT value, label FROM temp_dim
-            """)
-
-            # Ajout de la vue correspondante
-            self.conn.execute("DROP VIEW temp_dim")
-
-            # Logging
-            self.logger.info(
-                f"Successfully registered duckdb dimension table for {dim_name}"
-            )
-
     # Méthode de création de la table d'informations
     def create_duckdb_fact_table(
         self,
         table_name: str | None = "fact_table",
-        table_prefix: str | None = "dim_",
         column_labels: dict[str, str] | None = None,
         partition_by: list[str] | None = None,
     ) -> None:
@@ -280,8 +262,6 @@ class DuckLakeTablesBuilder:
         Args:
             table_name (Optional[str]): Name of the fact table in DuckDB. Defaults to
                 'fact_table'.
-            table_prefix (Optional[str]): Prefix for dimension table names. Defaults to
-                'dim_'.
             column_labels (Optional[Dict[str, str]]): Optional mapping of column names
                 to labels.
             partition_by (Optional[List[str]]): Column names to partition the table by
@@ -347,8 +327,8 @@ class DuckLakeTablesBuilder:
 
                 # Logging
                 self.logger.info(
-                    f"The fact_table is successfully partitionned among"
-                    f" the following dimensions : ({partition_by})"
+                    f"The fact_table is successfully partitionned on"
+                    f" the following keys : ({partition_by})"
                 )
 
             # Insertion des données depuis la vue temporaire.
@@ -381,31 +361,80 @@ class DuckLakeTablesBuilder:
         # Suppression de la vue temporaire
         self.conn.execute("DROP VIEW temp_fact")
 
-        # Logging des clés étrangères créées (pour information)
-        prefix = table_prefix or "dim_"
-        for dim_name in self.schema_builder.dimension_tables.keys():
-            dim_table = self._qualified(f"{prefix}{dim_name}")
-            self.logger.info(
-                f"Foreign key created for dimension '{dim_name}' - can be joined on"
-                f" {qualified_name}.{quote_ident(dim_name)} = {dim_table}.value"
-            )
-
         # Logging
         self.logger.info("Successfully registered duckdb fact table")
+
+    # Méthode de création de la table des méta-données du jeu de résultats
+    def create_duckdb_dataset_metadata_table(
+        self,
+        table_name: str | None = "dataset_metadata",
+    ) -> None:
+        """
+        Create the single-row ``dataset_metadata`` table describing the result set.
+
+        ``updated_at`` and ``schema_version`` are always filled in; ``label``,
+        ``description`` and ``source`` come from the optional builder arguments.
+        ``cluster_by`` is left NULL: physical sort keys are handled separately.
+
+        Args:
+            table_name (Optional[str]): Name of the table in DuckDB. Defaults to
+                'dataset_metadata'.
+
+        Examples:
+            >>> builder.create_duckdb_dataset_metadata_table()
+        """
+        # Nom qualifié par le schéma (et le catalogue) cible
+        qualified_name = self._qualified(table_name or "dataset_metadata")
+
+        # Création de la table : une seule ligne par schéma
+        self.conn.execute(f"""
+            CREATE TABLE {qualified_name} (
+                label VARCHAR,
+                description VARCHAR,
+                source VARCHAR,
+                updated_at TIMESTAMP,
+                schema_version INTEGER,
+                cluster_by VARCHAR
+            )
+        """)
+
+        # Insertion de l'unique ligne descriptive.
+        # Horodatage lié en Python plutôt que via now() : la colonne est un TIMESTAMP
+        # sans fuseau, là où now() renvoie un TIMESTAMP WITH TIME ZONE.
+        self.conn.execute(
+            f"""
+            INSERT INTO {qualified_name}
+                (label, description, source, updated_at, schema_version, cluster_by)
+            VALUES (?, ?, ?, ?, ?, NULL)
+            """,
+            [
+                self.dataset_label,
+                self.dataset_description,
+                self.dataset_source,
+                datetime.now(),
+                SCHEMA_VERSION,
+            ],
+        )
+
+        # Logging
+        self.logger.info(
+            f"Successfully registered duckdb dataset meta-data table"
+            f" (schema_version={SCHEMA_VERSION})"
+        )
 
     # Méthode de construction du schéma
     def build_schema(
         self,
         metadata_table: str | None = "metadata",
         fact_table: str | None = "fact_table",
-        dim_table_prefix: str | None = "dim_",
+        dataset_metadata_table: str | None = "dataset_metadata",
         column_labels: dict[str, str] | None = None,
         check_duplicates: bool = True,
         keep: Literal["any", "none", "first", "last"] = "none",
         partition_by: list[str] | None = None,
     ) -> None:
         """
-        Build the entire schema in DuckDB, including metadata, dimension, and fact
+        Build the entire schema in DuckDB: metadata, fact and dataset_metadata
         tables.
 
         Args:
@@ -413,8 +442,8 @@ class DuckLakeTablesBuilder:
                 'metadata'.
             fact_table (Optional[str]): Name of the fact table. Defaults to
                 'fact_table'.
-            dim_table_prefix (Optional[str]): Prefix for dimension tables. Defaults to
-                'dim_'.
+            dataset_metadata_table (Optional[str]): Name of the dataset metadata
+                table. Defaults to 'dataset_metadata'.
             column_labels (Optional[Dict[str, str]]): Optional mapping of column names
                 to labels.
             check_duplicates (bool): Whether to check and remove duplicates. Defaults to
@@ -471,17 +500,16 @@ class DuckLakeTablesBuilder:
             table_name=metadata_table, column_labels=column_labels
         )
 
-        # Création de la table de dimensions
-        self.create_duckdb_dimension_tables(
-            table_prefix=dim_table_prefix, column_labels=column_labels
-        )
-
         # Création de la table d'informations avec partitionnement optionnel
         self.create_duckdb_fact_table(
             table_name=fact_table,
-            table_prefix=dim_table_prefix,
             column_labels=column_labels,
             partition_by=partition_by,
+        )
+
+        # Création de la table des méta-données du jeu de résultats
+        self.create_duckdb_dataset_metadata_table(
+            table_name=dataset_metadata_table
         )
 
     # Méthode d'affichage du schéma

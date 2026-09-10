@@ -22,7 +22,7 @@ from dt_ducklake_manager.schema import DuckLakeTablesBuilder
 
 
 # Fixture fournissant une connexion avec DEUX catalogues DuckLake attachés,
-# chacun portant un schéma 'main' complet (fact_table, metadata, dim_*).
+# chacun portant un schéma 'main' complet (fact_table, metadata, dataset_metadata).
 @pytest.fixture
 def two_catalogs_connection(tmp_path: Path) -> duckdb.DuckDBPyConnection:
     """Provide a connection with two attached DuckLake catalogs, each fully built.

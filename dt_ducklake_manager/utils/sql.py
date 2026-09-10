@@ -79,8 +79,8 @@ def qualify_table(table: str, schema: str = "main", catalog: str | None = None) 
     Build a schema- (and optionally catalog-) qualified SQL table identifier.
 
     A single DuckLake catalog may hold several schemas, each carrying its own
-    ``fact_table``, ``metadata`` and ``dim_*`` tables, so references must be
-    schema-qualified. Without catalog qualification a query resolves against the
+    ``fact_table``, ``metadata`` and ``dataset_metadata`` tables, so references
+    must be schema-qualified. Without catalog qualification a query resolves against the
     connection's **current** catalog (the last ``USE``), which would silently
     write to the wrong database as soon as a second catalog is attached. When
     ``catalog`` is provided, the identifier is fully qualified by it; when it is
@@ -89,7 +89,7 @@ def qualify_table(table: str, schema: str = "main", catalog: str | None = None) 
 
     Args:
         table (str): Bare table name (e.g. ``'fact_table'``, ``'metadata'``,
-            ``'dim_country'``).
+            ``'dataset_metadata'``).
         schema (str): Target DuckLake schema. Defaults to ``'main'``.
         catalog (str | None): Attached catalog alias. When ``None`` (default), the
             identifier is only schema-qualified.

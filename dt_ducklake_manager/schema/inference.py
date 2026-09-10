@@ -15,20 +15,24 @@ from ..utils.types import map_python_to_sql_type
 
 
 # Classe de création d'une base de données DuckDB avec :
-# - Une "Fact table" : Contenant les données
-# - Une "Label table" : Contenant les labels associés à chaque indicateur
-# - Une "Metadata table" : Contenant les caractéristiques des variables de la factable
-# (type, modalités etc ...)
+# - Une "Fact table" : contenant les données, libellés d'origine compris
+# - Une "Metadata table" : contenant les caractéristiques des variables de la fact table
+# (libellé, type SQL, statut catégoriel, clé primaire)
 class SchemaBuilder:
     """
-    A class to automate the creation of metadata, dimension tables, and fact tables
-    from a given DataFrame (pandas, polars, or narwhals-compatible), primarily for use
-    in data warehousing.
+    A class to automate the inference of the metadata and fact tables from a given
+    DataFrame (pandas, polars, or narwhals-compatible).
+
+    Categorical columns keep their original labels in the fact table — there is no
+    dimension table and no synthetic code anywhere in the schema.
 
     Attributes:
         df (nw.DataFrame): The input dataset (converted to narwhals).
-        categorical_threshold (int): Threshold for determining if a column is
-            categorical based on the number of unique modalities.
+        categorical_threshold (int): Threshold below which a textual column is
+            flagged as categorical, a UI-only piece of metadata.
+        categorical_overrides (dict[str, bool]): Per-column forcing of the
+            categorical status, independent of the threshold.
+        primary_keys (list[str]): Logical primary key columns.
         logger (logging.Logger): Logger instance for tracking processing steps.
     """
 
@@ -38,6 +42,7 @@ class SchemaBuilder:
         df: IntoDataFrame,
         categorical_threshold: int | None = None,
         primary_keys: list[str] | None = None,
+        categorical_overrides: dict[str, bool] | None = None,
         log_filename: str | os.PathLike[str] | None = None,
     ) -> None:
         """
@@ -46,18 +51,26 @@ class SchemaBuilder:
         Args:
             df: The input dataset (pandas, polars, or narwhals-compatible).
             categorical_threshold (Optional[int]): Maximum number of unique values
-                for a column to be considered categorical. When None (default), no
-                dimension tables are created and all object columns are marked as
-                non-categorical. Pass an integer (e.g. 50) to restore the previous
-                behaviour.
+                for a textual column to be flagged as categorical. When None
+                (default), no column is inferred as categorical. The flag is pure UI
+                metadata: it drives no storage decision, since the fact table always
+                stores the original labels.
             primary_keys (List[str], optional): List of column names to use as primary
             key.
                 Can be a single column or composite key. Defaults to None (no primary
                 key).
                 When None, deduplication will use all columns and a UserWarning is
                 raised.
+            categorical_overrides (Optional[Dict[str, bool]]): Per-column forcing of
+                the categorical status, independent of the threshold. A forced column
+                is marked ``is_categorical_forced`` in the metadata table and is never
+                re-evaluated by a subsequent update. Defaults to None.
             log_filename (os.PathLike, optional): Path to the log file. Defaults to
                 a file named `schema_builder.log` in a logs directory.
+
+        Raises:
+            ValueError: If a primary key or a ``categorical_overrides`` key does not
+                exist in the DataFrame.
 
         Examples:
             >>> # Single primary key (with polars)
@@ -72,19 +85,30 @@ class SchemaBuilder:
             >>> # No primary key — raises UserWarning
             >>> builder = SchemaBuilder(df)
 
-            >>> # Threshold disabled — no dimension tables are created
+            >>> # Threshold disabled — no column is inferred as categorical
             >>> builder = SchemaBuilder(df, categorical_threshold=None,
             primary_keys=['id'])
 
-            >>> # Threshold enabled — behaves like the original default
+            >>> # A column forced as categorical whatever its cardinality
             >>> builder = SchemaBuilder(df, categorical_threshold=50,
-            primary_keys=['id'])
+            ...     primary_keys=['id'], categorical_overrides={'city': True})
         """
         # Conversion vers narwhals
         self.df = nw.from_native(df, eager_only=True)
-        # Initialisation du seuil au deçà duquel les modalités d'une variable
-        # catégorielle ne sont plus exportées dans
+        # Initialisation du seuil en deçà duquel une colonne textuelle est signalée
+        # comme catégorielle dans la table de méta-données
         self.categorical_threshold = categorical_threshold
+
+        # Validation du forçage du statut catégoriel si spécifié
+        if categorical_overrides:
+            # Vérification de l'existence des colonnes visées
+            unknown_cols = set(categorical_overrides) - set(self.df.columns)
+            if unknown_cols:
+                raise ValueError(
+                    f"The following categorical_overrides columns do not exist in the"
+                    f" DataFrame: {sorted(unknown_cols)}"
+                )
+        self.categorical_overrides = categorical_overrides or {}
 
         # Validation des clés primaires si spécifiées
         if primary_keys is not None and len(primary_keys) > 0:
@@ -128,9 +152,13 @@ class SchemaBuilder:
         self, column_labels: dict[str, str] | None | None = None
     ) -> nw.DataFrame[Any]:
         """
-        Automatically infer metadata for the DataFrame's columns, including types,
-        labels,
-        and categorical attributes.
+        Automatically infer metadata for the DataFrame's columns, including SQL types,
+        labels, and the categorical UI flag.
+
+        The ``is_categorical`` flag is inferred from the cardinality of textual
+        columns and can be forced per column through ``categorical_overrides``; a
+        forced column carries ``is_categorical_forced = True`` so that no later
+        update re-evaluates it.
 
         Args:
             column_labels (dict, optional): A dictionary mapping column names to labels.
@@ -139,6 +167,12 @@ class SchemaBuilder:
         Returns:
             nw.DataFrame: A DataFrame containing metadata for each column in the input
             dataset.
+
+        Examples:
+            >>> metadata = builder.create_metadata_table()
+            >>> sorted(metadata.columns)  # doctest: +NORMALIZE_WHITESPACE
+            ['is_categorical', 'is_categorical_forced', 'is_primary_key', 'label',
+             'name', 'sql_type']
         """
         # Initialisation de la liste des méta-données
         list_metadata = []
@@ -146,7 +180,6 @@ class SchemaBuilder:
         for col in self.df.columns:
             # Extraction du type de la colonne (narwhals DType)
             dtype_obj = self.df.schema[col]
-            dtype_str = str(dtype_obj)
             # Initialisation des méta-données associées à la colonne
             if column_labels is not None:
                 metadata = {
@@ -154,21 +187,19 @@ class SchemaBuilder:
                     "label": column_labels[col]
                     if col in column_labels.keys()
                     else col.replace("_", " ").title(),
-                    "python_type": dtype_str,
                     "sql_type": map_python_to_sql_type(dtype_obj),
                     "is_categorical": False,
+                    "is_categorical_forced": False,
                     "is_primary_key": col in self.primary_keys,
-                    # 'modalities': None
                 }
             else:
                 metadata = {
                     "name": col,
                     "label": col.replace("_", " ").title(),
-                    "python_type": dtype_str,
                     "sql_type": map_python_to_sql_type(dtype_obj),
                     "is_categorical": False,
+                    "is_categorical_forced": False,
                     "is_primary_key": col in self.primary_keys,
-                    # 'modalities': None
                 }
 
             # Logging
@@ -204,6 +235,18 @@ class SchemaBuilder:
                             f" threshold criteria {self.categorical_threshold}"
                         )
 
+            # Forçage explicite du statut catégoriel, indépendant du seuil.
+            # Le marqueur is_categorical_forced empêche toute ré-évaluation ultérieure
+            # par un update.
+            if col in self.categorical_overrides:
+                metadata["is_categorical"] = self.categorical_overrides[col]
+                metadata["is_categorical_forced"] = True
+                # Logging
+                self.logger.info(
+                    f"The categorical status of column '{col}' is forced to"
+                    f" {metadata['is_categorical']} by categorical_overrides"
+                )
+
             # Ajout au dictionnaire
             list_metadata.append(metadata)
 
@@ -221,95 +264,32 @@ class SchemaBuilder:
 
         return self.df_metadata
 
-    # Méthode créant la dimension table
-    def create_dimension_tables(
-        self, column_labels: dict[str, str] | None | None = None
-    ) -> dict[str, nw.DataFrame[Any]]:
-        """
-        Generate dimension tables for categorical columns in the dataset.
-
-        Args:
-            column_labels (dict, optional): A dictionary mapping column names to labels.
-                                            Defaults to None.
-
-        Returns:
-            dict: A dictionary of DataFrames, where keys are column names and values are
-                  the corresponding dimension tables (narwhals DataFrames).
-        """
-        # Création d'une table de méta-données si cette-dernière n'existe pas déjà
-        if not hasattr(self, "df_metadata"):
-            _ = self.create_metadata_table(column_labels=column_labels)
-
-        # Initialisation du dictionnaire des tables de dimension
-        self.dimension_tables = {}
-
-        # Parcours des tables de dimensions
-        categorical_cols = self.df_metadata.filter(nw.col("is_categorical"))[
-            "name"
-        ].to_list()
-        for categorical_dimension in categorical_cols:
-            # Extraction des modalités uniques et construction de la table de dimension.
-            # Exclusion explicite des valeurs manquantes : un NULL/None/NaN dans la
-            # colonne d'origine doit rester NULL dans la fact_table, sans pendant dans
-            # la table de dimension (pas de ligne avec label=None).
-            unique_vals = self.df[categorical_dimension].drop_nulls().unique().sort()
-            unique_list = unique_vals.to_list()
-
-            # Création de la table de dimension via narwhals (même backend que self.df)
-            self.dimension_tables[categorical_dimension] = nw.from_dict(
-                {"value": list(range(len(unique_list))), "label": unique_list},
-                backend=nw.get_native_namespace(self.df),
-            ).sort("label")
-            # Logging
-            self.logger.info(
-                f"Successfully built dimension table for '{categorical_dimension}'"
-            )
-
-        # Logging
-        self.logger.info("Successfully built dimension tables")
-
-        return self.dimension_tables
-
     # Méthode créant la table des informations
     def create_fact_table(
         self, column_labels: dict[str, str] | None | None = None
     ) -> nw.DataFrame[Any]:
         """
-        Generate a fact table by replacing categorical values with corresponding IDs.
+        Return the fact table, i.e. the input dataset itself.
+
+        Categorical columns keep their **original labels**: Parquet
+        dictionary-encoding absorbs the storage cost, so no synthetic code and no
+        dimension table are involved. The frame is copied rather than aliased so
+        that later mutations of the fact table do not reach the input dataset.
 
         Args:
-            column_labels (dict, optional): A dictionary mapping column names to labels.
-                                            Defaults to None.
+            column_labels (dict, optional): Accepted for signature parity with the
+                other builders; unused here. Defaults to None.
 
         Returns:
-            nw.DataFrame: The fact table with categorical values replaced by IDs.
+            nw.DataFrame: The fact table, holding the input values verbatim.
+
+        Examples:
+            >>> fact_table = builder.create_fact_table()
+            >>> fact_table['category'].to_list()
+            ['A', 'B', 'A']
         """
-        # Création des tables de dimensions si ces-dernières n'existent pas
-        if not hasattr(self, "dimension_tables"):
-            _ = self.create_dimension_tables(column_labels=column_labels)
-
-        # Initialisation de la table des informations
+        # Table des faits : copie du jeu de données d'entrée, sans substitution
         self.df_fact = self.df.clone()
-
-        # Remplacement des labels par leur valeur entière via un join narwhals
-        for column in self.dimension_tables.keys():
-            dim_df = self.dimension_tables[column]
-            # Sauvegarde de l'ordre des colonnes pour le restaurer après le join
-            original_columns = self.df_fact.columns
-            # Renommage de la table de dimension : 'label' → nom de la colonne, 'value'
-            # → colonne temporaire
-            dim_renamed = dim_df.rename({"label": column, "value": f"__{column}_id"})
-            # Jointure à gauche : chaque modalité est associée à son ID entier
-            self.df_fact = (
-                self.df_fact.join(dim_renamed, on=column, how="left")
-                .drop(column)
-                .rename({f"__{column}_id": column})
-                .select(original_columns)
-            )
-            # Logging
-            self.logger.info(
-                f"Successfully replace modalities by ids in column '{column}'"
-            )
 
         # Logging
         self.logger.info("Successfully built fact table")
@@ -319,26 +299,26 @@ class SchemaBuilder:
     # Méthode créant les différentes tables
     def build(
         self, column_labels: dict[str, str] | None | None = None
-    ) -> tuple[nw.DataFrame[Any], dict[str, nw.DataFrame[Any]], nw.DataFrame[Any]]:
+    ) -> tuple[nw.DataFrame[Any], nw.DataFrame[Any]]:
         """
-        Execute the full pipeline to create metadata, dimension tables, and a fact
-        table.
+        Execute the full pipeline to create the metadata and fact tables.
 
         Args:
             column_labels (dict, optional): A dictionary mapping column names to labels.
                                             Defaults to None.
 
         Returns:
-            tuple: A tuple containing:
-                   - Metadata DataFrame (narwhals).
-                   - Dictionary of dimension tables (narwhals DataFrames).
-                   - Fact table DataFrame (narwhals).
+            tuple: A tuple containing the metadata DataFrame and the fact table
+            DataFrame, both narwhals frames.
+
+        Examples:
+            >>> metadata, fact_table = builder.build()
+            >>> len(metadata) == len(fact_table.columns)
+            True
         """
         # Création de la table des méta-données
         _ = self.create_metadata_table(column_labels=column_labels)
-        # Création des tables de dimension
-        _ = self.create_dimension_tables(column_labels=column_labels)
-        # Création des tables d'informations
+        # Création de la table des faits
         _ = self.create_fact_table(column_labels=column_labels)
 
-        return self.df_metadata, self.dimension_tables, self.df_fact
+        return self.df_metadata, self.df_fact

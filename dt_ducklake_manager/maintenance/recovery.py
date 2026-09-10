@@ -11,10 +11,7 @@ from typing import Any
 
 # DuckDB
 import duckdb
-import narwhals as nw
 import polars as pl
-
-from .._internal.managers.dimension import DimensionManager
 
 # Import des utilitaires
 from ..utils.logger import _init_logger
@@ -38,14 +35,13 @@ class RecoveryStrategy(Enum):
     ``DuckLakeConnector(..., snapshot_version=N)`` and reload the data.
 
     For structural or consistency issues that do not require rolling back data,
-    the in-place repair strategies (``REPAIR_SCHEMA``, ``REBUILD_DIMENSIONS``,
+    the in-place repair strategies (``REPAIR_SCHEMA``,
     ``CLEAN_ORPHANED_DATA``, ``VALIDATE_AND_FIX``) operate directly on the live
     catalog without touching the snapshot history.
     """
 
     USE_SNAPSHOT_HISTORY = "use_snapshot_history"
     REPAIR_SCHEMA = "repair_schema"
-    REBUILD_DIMENSIONS = "rebuild_dimensions"
     CLEAN_ORPHANED_DATA = "clean_orphaned_data"
     VALIDATE_AND_FIX = "validate_and_fix"
 
@@ -436,8 +432,6 @@ class DatabaseRecoveryManager:
                 result = self._recover_use_snapshot_history(operation)
             elif operation.strategy == RecoveryStrategy.REPAIR_SCHEMA:
                 result = self._recover_repair_schema(operation)
-            elif operation.strategy == RecoveryStrategy.REBUILD_DIMENSIONS:
-                result = self._recover_rebuild_dimensions(operation)
             elif operation.strategy == RecoveryStrategy.CLEAN_ORPHANED_DATA:
                 result = self._recover_clean_orphaned_data(operation)
             elif operation.strategy == RecoveryStrategy.VALIDATE_AND_FIX:
@@ -743,8 +737,8 @@ class DatabaseRecoveryManager:
                 "Étape 2 — Lire les tables depuis cette connexion :",
                 "  fact_df = conn_old.execute('SELECT * FROM fact_table').pl()",
                 "  meta_df = conn_old.execute('SELECT * FROM metadata').pl()",
-                "  # Répéter pour chaque table de dimension :",
-                "  #   dim_df = conn_old.execute('SELECT * FROM dim_<col>').pl()",
+                "  ds_df   = conn_old.execute('SELECT * FROM dataset_metadata')"
+                ".pl()",
                 "",
                 "Étape 3 — Vider les tables du catalogue courant et réinsérer les"
                 " données :",
@@ -752,7 +746,7 @@ class DatabaseRecoveryManager:
                 "  conn.register('_restore_fact', fact_df)",
                 "  conn.execute('INSERT INTO fact_table SELECT * FROM _restore_fact')",
                 "  conn.execute('DROP VIEW _restore_fact')",
-                "  # Répéter pour metadata et chaque table de dimension",
+                "  # Répéter pour metadata et dataset_metadata",
                 "",
                 "Étape 4 — Valider l'intégrité après restauration :",
                 f"  auditor = DatabaseAuditor(conn, schema='{self.schema}')",
@@ -884,9 +878,9 @@ class DatabaseRecoveryManager:
                     CREATE TABLE IF NOT EXISTS {self._qualified("metadata")} (
                         name VARCHAR,
                         label VARCHAR,
-                        python_type VARCHAR,
                         sql_type VARCHAR,
                         is_categorical BOOLEAN,
+                        is_categorical_forced BOOLEAN DEFAULT FALSE,
                         is_primary_key BOOLEAN DEFAULT FALSE
                     )
                 """)
@@ -896,32 +890,6 @@ class DatabaseRecoveryManager:
             # Cas 2: Colonnes manquantes dans metadata → ajout avec valeurs par défaut
             if "Missing required columns in metadata" in issue.description:
                 return self._add_missing_metadata_columns(issue)
-
-            # Cas 3: Table de dimension manquante pour colonne catégorielle
-            if (
-                "Dimension table" in issue.description
-                and "missing" in issue.description.lower()
-            ):
-                col_name = issue.column_name
-                if col_name:
-                    # Récupération des valeurs distinctes de la fact_table puis
-                    # création/mise à jour de la table de dimension.
-                    # update_dimension_values crée la table si elle n'existe pas encore.
-                    dim_mgr = DimensionManager(
-                        self.conn,
-                        self.categorical_threshold,
-                        schema=self.schema,
-                        catalog_alias=self.catalog_alias,
-                    )
-                    fact_table = self._qualified("fact_table")
-                    values_pl = self.conn.execute(
-                        f"SELECT DISTINCT {quote_ident(col_name)} FROM"
-                        f" {fact_table} WHERE {quote_ident(col_name)} IS NOT NULL"
-                    ).pl()[col_name]
-                    values_nw = nw.from_native(values_pl, series_only=True)
-                    dim_mgr.update_dimension_values(col_name, values_nw)
-                    self.logger.info(f"Created missing dimension table for {col_name}")
-                    return True
 
             # Autres cas: pas de fix automatique possible
             return False
@@ -946,9 +914,9 @@ class DatabaseRecoveryManager:
             required_columns = {
                 "name": "VARCHAR",
                 "label": "VARCHAR",
-                "python_type": "VARCHAR",
                 "sql_type": "VARCHAR",
                 "is_categorical": "BOOLEAN",
+                "is_categorical_forced": "BOOLEAN DEFAULT FALSE",
                 "is_primary_key": "BOOLEAN DEFAULT FALSE",
             }
 
@@ -979,106 +947,6 @@ class DatabaseRecoveryManager:
         except Exception as e:
             self.logger.error(f"Error adding missing metadata columns: {e}")
             return False
-
-    # Méthode de reconstruction des tables de dimension corrompues
-    def _recover_rebuild_dimensions(
-        self, operation: RecoveryOperation
-    ) -> RecoveryResult:
-        """Recover by rebuilding corrupted dimension tables.
-
-        Cleans orphaned entries, recreates missing tables, and synchronizes
-        dimension values with fact table data.
-
-        Args:
-            operation: Recovery operation parameters.
-
-        Returns:
-            RecoveryResult with details of dimension table repairs.
-        """
-        try:
-            # Initialisation de la liste des opérations réalisées
-            operations_performed = []
-
-            # Reconstruction des tables de dimension corrompues
-            # Initialisation du gestionnaire des dimensions
-            dim_mgr = DimensionManager(
-                self.conn,
-                self.categorical_threshold,
-                schema=self.schema,
-                catalog_alias=self.catalog_alias,
-            )
-
-            # Étape 1: Nettoyage des entrées orphelines
-            cleaned = dim_mgr.cleanup_orphaned_dimension_entries()
-            # Parcours des résultats du nettoyage
-            for dim_name, count in cleaned.items():
-                if count > 0:
-                    operations_performed.append(
-                        f"Cleaned {count} orphaned entries from {dim_name}"
-                    )
-
-            # Étape 2: Reconstruction des tables de dimension manquantes
-            try:
-                metadata = self.conn.execute(
-                    f"SELECT name, is_categorical FROM {self._qualified('metadata')}"
-                ).pl()
-                categorical_cols = metadata.filter(pl.col("is_categorical"))[
-                    "name"
-                ].to_list()
-
-                for col_name in categorical_cols:
-                    dim_table = f"dim_{col_name}"
-                    if not self._table_exists(dim_table):
-                        # Recréation de la table de dimension à partir de la fact_table.
-                        # update_dimension_values crée la table si elle n'existe pas.
-                        values_pl = self.conn.execute(
-                            f"SELECT DISTINCT {quote_ident(col_name)} FROM"
-                            f" {self._qualified('fact_table')} WHERE"
-                            f" {quote_ident(col_name)} IS NOT NULL"
-                        ).pl()[col_name]
-                        values_nw = nw.from_native(values_pl, series_only=True)
-                        added = dim_mgr.update_dimension_values(col_name, values_nw)
-                        operations_performed.append(
-                            f"Recreated {dim_table} with {added} values"
-                        )
-            except Exception as e:
-                operations_performed.append(f"Error rebuilding missing tables: {e}")
-
-            # Étape 3: Synchronisation des entrées manquantes dans les tables existantes
-            try:
-                for col_name in categorical_cols:
-                    dim_table = f"dim_{col_name}"
-                    if self._table_exists(dim_table):
-                        # Ajout des valeurs de fact_table manquantes dans dimension
-                        fact_values = self.conn.execute(
-                            f"SELECT DISTINCT {quote_ident(col_name)} FROM"
-                            f" {self._qualified('fact_table')} WHERE"
-                            f" {quote_ident(col_name)} IS NOT NULL"
-                        ).pl()[col_name]
-                        added = dim_mgr.update_dimension_values(col_name, fact_values)
-                        if added > 0:
-                            operations_performed.append(
-                                f"Added {added} missing entries to {dim_table}"
-                            )
-            except Exception as e:
-                operations_performed.append(f"Error syncing dimension entries: {e}")
-
-            operations_performed.append("Dimension table reconstruction completed")
-
-            return RecoveryResult(
-                success=True,
-                strategy_used=operation.strategy,
-                recovery_time=0,
-                operations_performed=operations_performed,
-            )
-
-        except Exception as e:
-            return RecoveryResult(
-                success=False,
-                strategy_used=operation.strategy,
-                recovery_time=0,
-                error_message=str(e),
-            )
 
     # Méthode de nettoyage des données orphelines
     def _recover_clean_orphaned_data(
@@ -1161,16 +1029,7 @@ class DatabaseRecoveryManager:
             for issue in validation_report.issues:
                 try:
                     # Correction basée sur le type d'issue
-                    if issue.issue_type.value == "orphaned_reference":
-                        # Nettoyage des références orphelines
-                        cleaned = self._cleanup_orphaned_references_for_issue(issue)
-                        if cleaned:
-                            operations_performed.append(
-                                f"Fixed orphaned references: {issue.description}"
-                            )
-                            fixed_count += 1
-
-                    elif issue.issue_type.value == "data_integrity":
+                    if issue.issue_type.value == "data_integrity":
                         # Correction des problèmes d'intégrité des données
                         if "null values" in issue.description.lower():
                             fixed = self._fix_null_value_issue(issue)
@@ -1186,15 +1045,6 @@ class DatabaseRecoveryManager:
                         if fixed:
                             operations_performed.append(
                                 f"Fixed missing metadata: {issue.description}"
-                            )
-                            fixed_count += 1
-
-                    elif issue.issue_type.value == "invalid_dimension":
-                        # Correction des problèmes de dimension invalide
-                        fixed = self._fix_invalid_dimension_issue(issue)
-                        if fixed:
-                            operations_performed.append(
-                                f"Fixed invalid dimension: {issue.description}"
                             )
                             fixed_count += 1
 
@@ -1335,7 +1185,6 @@ class DatabaseRecoveryManager:
                 return RecoveryStrategy.VALIDATE_AND_FIX
 
             dominant_issue = sorted_issues[0][0]
-            dominant_score = sorted_issues[0][1]["score"]
             critical_count = validation_report.get_critical_issues_count()
 
             # Stratégie basée sur le problème dominant avec seuils de gravité
@@ -1346,8 +1195,6 @@ class DatabaseRecoveryManager:
 
             # Mapping type de problème → stratégie avec prise en compte du score
             strategy_mapping = {
-                "orphaned_reference": RecoveryStrategy.CLEAN_ORPHANED_DATA,
-                "invalid_dimension": RecoveryStrategy.REBUILD_DIMENSIONS,
                 "schema_inconsistency": RecoveryStrategy.REPAIR_SCHEMA
                 if allow_destructive
                 else RecoveryStrategy.VALIDATE_AND_FIX,
@@ -1356,14 +1203,6 @@ class DatabaseRecoveryManager:
                 "type_mismatch": RecoveryStrategy.VALIDATE_AND_FIX,
                 "constraint_violation": RecoveryStrategy.VALIDATE_AND_FIX,
             }
-
-            # Si le score dominant est élevé (>= 8), considérer une stratégie plus
-            # agressive
-            if dominant_score >= 8 and allow_destructive:
-                if dominant_issue == "schema_inconsistency":
-                    return RecoveryStrategy.REPAIR_SCHEMA
-                elif dominant_issue in ["invalid_dimension", "orphaned_reference"]:
-                    return RecoveryStrategy.REBUILD_DIMENSIONS
 
             return strategy_mapping.get(
                 dominant_issue, RecoveryStrategy.VALIDATE_AND_FIX
@@ -1548,47 +1387,6 @@ class DatabaseRecoveryManager:
             # Logging
             self.logger.error(f"Error cleaning up old recovery points: {e}")
 
-    def _cleanup_orphaned_references_for_issue(self, issue: ValidationIssue) -> bool:
-        """
-        Clean orphaned references for a specific issue.
-
-        Args:
-            issue: The validation issue to fix
-
-        Returns:
-            True if cleanup was successful
-        """
-        try:
-            col_name = issue.column_name
-            if not col_name:
-                return False
-
-            # Noms qualifiés par le schéma
-            fact_table = self._qualified("fact_table")
-            dim_table = self._qualified(f"dim_{col_name}")
-            # Identifiant de colonne issu des données : présent plusieurs fois
-            quoted_col = quote_ident(col_name)
-
-            if issue.table_name == "fact_table":
-                # Références orphelines dans fact_table → mettre à NULL
-                self.conn.execute(f"""
-                    UPDATE {fact_table} SET {quoted_col} = NULL
-                    WHERE {quoted_col} NOT IN (SELECT value FROM {dim_table})
-                """)
-            else:
-                # Entrées orphelines dans dimension → supprimer
-                self.conn.execute(f"""
-                    DELETE FROM {dim_table}
-                    WHERE value NOT IN (SELECT DISTINCT {quoted_col} FROM {fact_table}
-                    WHERE {quoted_col} IS NOT NULL)
-                """)
-
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Failed to cleanup orphaned references: {e}")
-            return False
-
     def _fix_null_value_issue(self, issue: ValidationIssue) -> bool:
         """
         Fix null value issues by deleting affected rows.
@@ -1658,13 +1456,13 @@ class DatabaseRecoveryManager:
                     self.conn.execute(
                         f"""
                         INSERT INTO {self._qualified("metadata")} (name, label,
-                        python_type, sql_type, is_categorical, is_primary_key)
-                        VALUES (?, ?, ?, ?, FALSE, FALSE)
+                        sql_type, is_categorical, is_categorical_forced,
+                        is_primary_key)
+                        VALUES (?, ?, ?, FALSE, FALSE, FALSE)
                     """,
                         [
                             col_name,
                             col_name.replace("_", " ").title(),
-                            "object",
                             sql_type,
                         ],
                     )
@@ -1689,64 +1487,7 @@ class DatabaseRecoveryManager:
             self.logger.error(f"Failed to fix missing metadata: {e}")
             return False
 
-    def _fix_invalid_dimension_issue(self, issue: ValidationIssue) -> bool:
-        """
-        Fix invalid dimension table issues.
-
-        Args:
-            issue: The validation issue to fix
-
-        Returns:
-            True if fix was applied successfully
-        """
-        try:
-            col_name = issue.column_name
-            if not col_name:
-                return False
-
-            # Nom nu (pour _table_exists) et nom qualifié (pour le SQL)
-            dim_name = f"dim_{col_name}"
-            dim_table = self._qualified(dim_name)
-            fact_table = self._qualified("fact_table")
-            dim_mgr = DimensionManager(
-                self.conn,
-                self.categorical_threshold,
-                schema=self.schema,
-                catalog_alias=self.catalog_alias,
-            )
-
-            # Cas 1: Table de dimension manquante → création
-            # update_dimension_values crée la table si elle n'existe pas.
-            if "missing" in issue.description.lower():
-                values_pl = self.conn.execute(
-                    f"SELECT DISTINCT {quote_ident(col_name)} FROM {fact_table}"
-                    f" WHERE {quote_ident(col_name)} IS NOT NULL"
-                ).pl()[col_name]
-                dim_mgr.update_dimension_values(
-                    col_name, nw.from_native(values_pl, series_only=True)
-                )
-                self.logger.info(f"Created missing dimension table {dim_table}")
-                return True
-
-            # Cas 2: Table de dimension corrompue → reconstruction
-            if self._table_exists(dim_name):
-                self.conn.execute(f"DROP TABLE {dim_table}")
-                values_pl = self.conn.execute(
-                    f"SELECT DISTINCT {quote_ident(col_name)} FROM {fact_table}"
-                    f" WHERE {quote_ident(col_name)} IS NOT NULL"
-                ).pl()[col_name]
-                dim_mgr.update_dimension_values(
-                    col_name, nw.from_native(values_pl, series_only=True)
-                )
-                self.logger.info(f"Rebuilt corrupted dimension table {dim_table}")
-                return True
-
-            return False
-
-        except Exception as e:
-            self.logger.error(f"Failed to fix invalid dimension: {e}")
-            return False
-
+    # Méthode de correction d'une incohérence de typage
     def _fix_type_mismatch_issue(self, issue: ValidationIssue) -> bool:
         """
         Fix type mismatch issues by casting or widening column type.
@@ -1762,26 +1503,37 @@ class DatabaseRecoveryManager:
             if not col_name:
                 return False
 
-            # Élargissement du type vers le type le moins restrictif (généralement
-            # VARCHAR)
-            # Note: DuckDB ne supporte pas ALTER COLUMN TYPE directement, donc
-            # recréation nécessaire
+            # Alignement de la méta-donnée sur le type physique réel de la colonne.
+            # La table des faits fait foi : écrire un type arbitraire dans metadata
+            # fabriquerait précisément l'incohérence que l'auditeur signale.
+            structure = self.conn.execute(
+                f"DESCRIBE {self._qualified('fact_table')}"
+            ).fetchall()
+            col_info = next((row for row in structure if row[0] == col_name), None)
+            if col_info is None:
+                return False
+            actual_sql_type = col_info[1]
+
             self.conn.execute(
                 f"""
                 UPDATE {self._qualified("metadata")}
-                SET sql_type = 'VARCHAR', python_type = 'object'
+                SET sql_type = ?
                 WHERE name = ?
             """,
-                [col_name],
+                [actual_sql_type, col_name],
             )
 
-            self.logger.info(f"Updated type for column {col_name} to VARCHAR")
+            self.logger.info(
+                f"Aligned metadata type for column {col_name} on"
+                f" fact_table ({actual_sql_type})"
+            )
             return True
 
         except Exception as e:
             self.logger.error(f"Failed to fix type mismatch: {e}")
             return False
 
+    # Méthode de correction d'une violation de contrainte sur les données
     def _fix_constraint_violation_issue(self, issue: ValidationIssue) -> bool:
         """
         Fix constraint violation issues (e.g., remove duplicates).

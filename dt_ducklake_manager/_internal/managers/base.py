@@ -3,6 +3,7 @@
 import os
 import threading
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any
 
 # DuckDB
@@ -14,11 +15,11 @@ from narwhals.typing import IntoDataFrame
 # Import des utilitaires
 from ...utils.logger import _init_logger
 from ...utils.sql import qualify_table, quote_ident, resolve_catalog
-from ...utils.types import map_python_to_sql_type
+from ...utils.types import map_python_to_sql_type, resolve_sql_type_conflict
 
 
 # Classe contenant des opérations utilitaires de base sur la base de données au schéma
-# métadonnées - table des faits - tables de dimensions
+# (table des faits - méta-données - méta-données du jeu de résultats)
 class BaseSchemaManager(ABC):
     """
     Base class for database schema management operations.
@@ -55,8 +56,8 @@ class BaseSchemaManager(ABC):
             categorical_threshold: Threshold for determining categorical variables.
             log_filename: Path to log file.
             schema: DuckLake schema holding the ``fact_table``, ``metadata`` and
-                ``dim_*`` tables to operate on. A single catalog can host several
-                schemas (one per result set). Defaults to ``'main'``.
+                ``dataset_metadata`` tables to operate on. A single catalog can host
+                several schemas (one per result set). Defaults to ``'main'``.
             catalog_alias: Alias of the attached DuckLake catalog, matching the
                 one passed to ``DuckLakeConnector`` (``ATTACH ... AS <alias>``).
                 Carried alongside ``schema`` so that table references can be
@@ -109,7 +110,7 @@ class BaseSchemaManager(ABC):
         Return a table name qualified by this manager's schema and catalog.
 
         Args:
-            table: Bare table name (e.g. ``'fact_table'``, ``'dim_country'``).
+            table: Bare table name (e.g. ``'fact_table'``, ``'metadata'``).
 
         Returns:
             The quoted, qualified identifier targeting :attr:`schema` (and the
@@ -146,18 +147,21 @@ class BaseSchemaManager(ABC):
                         eager_only=True,
                     )
                 except Exception:
-                    # Si la table n'existe pas encore, initialisation d'un DataFrame
-                    # vide
-                    self._metadata_cache = nw.from_dict(
-                        {
-                            "name": [],
-                            "label": [],
-                            "python_type": [],
-                            "sql_type": [],
-                            "is_categorical": [],
-                            "is_primary_key": [],
-                        },
-                        native_namespace=pl,
+                    # Table absente : DataFrame vide typé sur le schéma cible.
+                    # Les dtypes explicites sont indispensables pour que les filtres
+                    # booléens des appelants restent valides sur un frame vide.
+                    self._metadata_cache = nw.from_native(
+                        pl.DataFrame(
+                            schema={
+                                "name": pl.String,
+                                "label": pl.String,
+                                "sql_type": pl.String,
+                                "is_categorical": pl.Boolean,
+                                "is_categorical_forced": pl.Boolean,
+                                "is_primary_key": pl.Boolean,
+                            }
+                        ),
+                        eager_only=True,
                     )
 
             return self._metadata_cache.clone()
@@ -244,17 +248,23 @@ class BaseSchemaManager(ABC):
         ]
         return column in columns
 
-    # Méthode de vérification si une colonne a une table de dimension (équivalent à
-    # vérifier si elle est catégorielle)
-    def _is_dimension_column(self, column: str) -> bool:
+    # Méthode de vérification du statut catégoriel d'une colonne
+    def _is_categorical_column(self, column: str) -> bool:
         """
-        Check if a column is a dimension (categorical).
+        Check if a column is flagged as categorical in the metadata table.
+
+        The flag is UI metadata only: it says the column is browsed through a menu,
+        never that its values are stored differently.
 
         Args:
             column: Column name
 
         Returns:
             True if column is categorical
+
+        Example:
+            >>> manager._is_categorical_column('region')
+            True
         """
         # Recherche du statut catégoriel
         result = self.conn.execute(
@@ -310,25 +320,34 @@ class BaseSchemaManager(ABC):
         self, column: str, df: IntoDataFrame, label: str | None = None
     ) -> None:
         """
-        Add a new column to metadata table.
+        Add a new column to the metadata table, or refresh an existing row.
+
+        On an existing row the producer-owned fields are preserved: a ``label``
+        already recorded is never overwritten by a data update, and a column whose
+        categorical status was forced keeps it.
 
         Args:
             column: Column name
             df: DataFrame containing the column (any narwhals-compatible backend)
-            label: Custom label for the column. If None, defaults to formatted column
-            name.
+            label: Custom label for the column. If None, a label is derived from the
+                column name on insertion, and the recorded label is kept on update.
+
+        Example:
+            >>> manager._add_column_to_metadata('score', df)
         """
         # Conversion vers narwhals pour un accès uniforme au schéma
         df_nw = nw.from_native(df, eager_only=True)
         # Extraction du type narwhals de la colonne
         dtype_obj = df_nw.schema[column]
-        dtype_str = str(dtype_obj)
         # Conversion du type narwhals en SQL
         sql_type = map_python_to_sql_type(dtype_obj)
-        # Définition si la variable est catégorielle (String avec cardinalité ≤ seuil)
-        is_categorical = isinstance(dtype_obj, nw.String) and df_nw[
-            column
-        ].n_unique() <= (self.categorical_threshold or 0)
+        # Statut catégoriel : colonne textuelle dont la cardinalité respecte le seuil.
+        # Les valeurs manquantes sont exclues du comptage des modalités.
+        is_categorical = (
+            isinstance(dtype_obj, (nw.String, nw.Categorical, nw.Enum))
+            and self.categorical_threshold is not None
+            and df_nw[column].drop_nulls().n_unique() <= self.categorical_threshold
+        )
 
         # Nom qualifié de la table de métadonnées
         metadata_table = self._qualified("metadata")
@@ -338,16 +357,12 @@ class BaseSchemaManager(ABC):
             CREATE TABLE IF NOT EXISTS {metadata_table} (
                 name VARCHAR,
                 label VARCHAR,
-                python_type VARCHAR,
                 sql_type VARCHAR,
                 is_categorical BOOLEAN,
+                is_categorical_forced BOOLEAN DEFAULT FALSE,
                 is_primary_key BOOLEAN DEFAULT FALSE
             )
         """)
-
-        # Insertion de la nouvelle colonne
-        if label is None:
-            label = column.replace("_", " ").title()
 
         # Upsert manuel
         # Vérification de l'existence de la colonne avant d'insérer ou de mettre à jour.
@@ -357,24 +372,34 @@ class BaseSchemaManager(ABC):
         existing_count = _row[0] if _row is not None else 0
 
         if existing_count == 0:
-            # Colonne absente : insertion
+            # Colonne absente : insertion.
+            # Libellé par défaut dérivé du nom technique, statut jamais forcé (la
+            # colonne est découverte, pas déclarée par le producteur).
+            insert_label = (
+                label if label is not None else column.replace("_", " ").title()
+            )
             self.conn.execute(
                 f"""
-                INSERT INTO {metadata_table} (name, label, python_type, sql_type,
-                is_categorical, is_primary_key)
-                VALUES (?, ?, ?, ?, ?, FALSE)
+                INSERT INTO {metadata_table} (name, label, sql_type,
+                is_categorical, is_categorical_forced, is_primary_key)
+                VALUES (?, ?, ?, ?, FALSE, FALSE)
                 """,
-                [column, label, dtype_str, sql_type, is_categorical],
+                [column, insert_label, sql_type, is_categorical],
             )
         else:
-            # Colonne déjà présente : mise à jour des champs variables
+            # Colonne déjà présente : mise à jour des seuls champs dérivés des données.
+            # COALESCE préserve un libellé déjà renseigné par le producteur ; le CASE
+            # protège un statut catégoriel explicitement forcé.
             self.conn.execute(
                 f"""
                 UPDATE {metadata_table}
-                SET label = ?, python_type = ?, sql_type = ?, is_categorical = ?
+                SET label = COALESCE(?, label),
+                    sql_type = ?,
+                    is_categorical = CASE WHEN is_categorical_forced
+                                          THEN is_categorical ELSE ? END
                 WHERE name = ?
                 """,
-                [label, dtype_str, sql_type, is_categorical, column],
+                [label, sql_type, is_categorical, column],
             )
 
         # Invalidation du cache
@@ -437,73 +462,78 @@ class BaseSchemaManager(ABC):
         self, column: str, df: nw.DataFrame[Any], current_metadata: nw.DataFrame[Any]
     ) -> None:
         """
-        Resolve type conflicts using the least restrictive strategy.
+        Resolve a type conflict on SQL types, widening only.
+
+        The recorded ``metadata.sql_type`` is never narrowed: a stored ``BIGINT``
+        survives a batch of ``Int32``. Non-ordered types (temporal, decimal, binary)
+        are left untouched and reported. The fact table column is widened alongside
+        the metadata so both stay consistent.
 
         Args:
             column: Column name
             df: DataFrame with new data (narwhals)
             current_metadata: Current metadata (narwhals)
+
+        Example:
+            >>> manager._resolve_type_conflicts('amount', df, metadata)
         """
-        # Identification du type actuel de la colonne dans les métadonnées
-        matching = current_metadata.filter(nw.col("name") == column)["python_type"]
+        # Identification du type SQL actuellement enregistré
+        matching = current_metadata.filter(nw.col("name") == column)["sql_type"]
         if len(matching) == 0:
             return None
-        current_type = matching[0]
-        # Identification du nouveau type (chaîne narwhals, ex. 'String', 'Int64',
-        # 'Float64')
-        new_type = str(df.schema[column])
+        current_type = str(matching[0])
+
+        # Conservation du type existant si toutes les nouvelles valeurs sont nulles :
+        # narwhals infère alors 'Null', que map_python_to_sql_type replie sur VARCHAR,
+        # ce qui promouvrait à tort une colonne numérique connue en texte.
+        if df[column].is_null().all():
+            return None
+
+        # Type SQL du lot entrant
+        new_type = map_python_to_sql_type(df.schema[column])
         # Ne fait rien si inchangé
         if current_type == new_type:
             return None
 
-        # Conservation du type existant si toutes les nouvelles valeurs sont nulles :
-        # narwhals infère alors 'Null' sans information sur le type réel de la colonne,
-        # ce qui écraserait à tort un type numérique connu.
-        if df[column].is_null().all():
+        # Résolution par élargissement uniquement
+        resolved_type = resolve_sql_type_conflict(current_type, new_type)
+        if resolved_type is None:
+            # Type non ordonné ou lot plus étroit : le type enregistré est conservé
+            self.logger.info(
+                f"Type conflict for {column}: incoming {new_type} does not widen"
+                f" stored {current_type}; metadata left unchanged"
+            )
             return None
 
-        # Hiérarchie des types narwhals (du plus contraignant au moins contraignant).
-        # Les types entiers de largeur variable sont tous regroupés au niveau 2.
-        type_hierarchy = {
-            "Boolean": 1,
-            "Int8": 2,
-            "Int16": 2,
-            "Int32": 2,
-            "Int64": 2,
-            "UInt8": 2,
-            "UInt16": 2,
-            "UInt32": 2,
-            "UInt64": 2,
-            "Float32": 3,
-            "Float64": 3,
-            "String": 4,
-        }
-
-        current_level = type_hierarchy.get(current_type, 0)
-        new_level = type_hierarchy.get(new_type, 0)
-
-        # Sélection du type le moins contraignant
-        if new_level > current_level:
-            # Le nouveau type est moins contraignant : mise à jour vers new_type
-            resolved_type = new_type
-            sql_type = map_python_to_sql_type(df.schema[column])
-            # Mise à jour des métadonnées
+        # Élargissement de la colonne de la table des faits, pour que le type
+        # enregistré et le type physique restent cohérents (contrôlé par l'auditeur).
+        # Échec non bloquant : la métadonnée reste la référence déclarative.
+        try:
             self.conn.execute(
-                f"""
-                UPDATE {self._qualified("metadata")}
-                SET python_type = ?, sql_type = ?
-                WHERE name = ?
-            """,
-                [resolved_type, sql_type, column],
+                f"ALTER TABLE {self._qualified('fact_table')}"
+                f" ALTER {quote_ident(column)} SET DATA TYPE {resolved_type}"
             )
-            # Invalidation du cache
-            self._invalidate_metadata_cache()
-            # Logging
-            self.logger.info(
-                f"Type conflict resolution for {column}: {current_type} ->"
-                f" {resolved_type}"
+        except Exception as e:
+            self.logger.warning(
+                f"Could not widen fact_table.{column} to {resolved_type}: {e}"
             )
-        # Si current_level >= new_level, le type existant est conservé sans modification
+
+        # Mise à jour du type SQL enregistré
+        self.conn.execute(
+            f"""
+            UPDATE {self._qualified("metadata")}
+            SET sql_type = ?
+            WHERE name = ?
+        """,
+            [resolved_type, column],
+        )
+        # Invalidation du cache
+        self._invalidate_metadata_cache()
+        # Logging
+        self.logger.info(
+            f"Type conflict resolution for {column}: {current_type} ->"
+            f" {resolved_type}"
+        )
 
     # Méthode utilitaire pour les colonnes contenant uniquement des valeurs nulles
     def _get_null_only_columns(self) -> list[str]:
@@ -542,33 +572,115 @@ class BaseSchemaManager(ABC):
             self.logger.error(f"An error occurred while detecting null values: {e}")
             raise
 
-    # Méthode de vérification du seuil catégoriel
-    def _check_categorical_threshold(
-        self, values: nw.Series[Any], threshold: int | None = None
-    ) -> bool:
+    # Méthode d'actualisation du statut catégoriel des colonnes textuelles
+    def _refresh_categorical_flags(self) -> list[str]:
         """
-        Check if values meet categorical threshold criteria.
+        Recompute the ``is_categorical`` flag of every eligible VARCHAR column.
 
-        Args:
-            values: Narwhals Series with column values
-            threshold: Threshold to use (defaults to instance threshold)
+        The status is pure UI metadata: it is derived from the current distinct
+        count of the fact table compared against ``categorical_threshold``, and only
+        a plain ``UPDATE metadata`` is issued — the fact table is never rewritten.
+        Columns whose status was forced by the producer
+        (``is_categorical_forced``) are skipped, and an ``UPDATE`` is emitted only
+        when the boolean actually changes.
 
         Returns:
-            True if values should be categorical
+            List of column names whose flag was flipped. Empty when nothing changed
+            or when no threshold is configured.
+
+        Example:
+            >>> manager._refresh_categorical_flags()
+            ['high_cardinality']
         """
-        effective_threshold = threshold or self.categorical_threshold
-        # Suppression des valeurs nulles avant le comptage
-        non_null_values = values.drop_nulls()
-        # Une série entièrement nulle ne peut pas être considérée catégorielle :
-        # l'absence de modalités observées ne constitue pas une information de
-        # cardinalité.
-        if len(non_null_values) == 0:
-            return False
-        # Aucun seuil défini : impossible de déterminer le statut catégoriel
-        if effective_threshold is None:
-            return False
-        unique_count = non_null_values.n_unique()
-        return unique_count <= effective_threshold
+        # Liste des colonnes dont le statut a effectivement basculé
+        changed: list[str] = []
+
+        # Absence de seuil : le statut catégoriel n'est pas ré-évaluable
+        if self.categorical_threshold is None:
+            return changed
+
+        try:
+            # Chargement des méta-données courantes
+            current_metadata = self._load_current_metadata()
+            if len(current_metadata) == 0:
+                return changed
+
+            # Sélection des colonnes textuelles dont le statut n'a pas été forcé
+            candidates = current_metadata.filter(
+                (nw.col("sql_type") == "VARCHAR")
+                & (~nw.col("is_categorical_forced"))
+            )
+
+            # Colonnes réellement présentes dans la table des faits
+            fact_columns = set(self._get_fact_table_columns())
+            # Nom qualifié de la table des faits
+            fact_table = self._qualified("fact_table")
+
+            for col_name, was_categorical in zip(
+                candidates["name"].to_list(),
+                candidates["is_categorical"].to_list(),
+            ):
+                # Colonne absente de la table des faits : rien à recalculer
+                if col_name not in fact_columns:
+                    continue
+
+                # Comptage des modalités sur l'état courant de la table des faits
+                quoted_col = quote_ident(col_name)
+                row = self.conn.execute(
+                    f"SELECT COUNT(DISTINCT {quoted_col}) FROM {fact_table}"
+                    f" WHERE {quoted_col} IS NOT NULL"
+                ).fetchone()
+                n_distinct = int(row[0]) if row is not None else 0
+
+                # Statut attendu : au moins une modalité observée et seuil respecté.
+                # Une colonne entièrement nulle n'est pas catégorielle, l'absence de
+                # modalités ne constituant pas une information de cardinalité.
+                is_categorical = 0 < n_distinct <= self.categorical_threshold
+
+                # Écriture uniquement en cas de bascule effective
+                if bool(was_categorical) is is_categorical:
+                    continue
+
+                # Mise à jour du booléen et invalidation du cache
+                self._update_categorical_status(col_name, is_categorical)
+                changed.append(col_name)
+                # Logging
+                self.logger.info(
+                    f"Categorical status of '{col_name}' set to {is_categorical}"
+                    f" ({n_distinct} distinct values, threshold"
+                    f" {self.categorical_threshold})"
+                )
+
+            return changed
+
+        except Exception as e:
+            # Logging
+            self.logger.error(f"Error refreshing categorical flags: {e}")
+            return changed
+
+    # Méthode d'horodatage de la dernière écriture réussie
+    def _touch_dataset_metadata(self) -> None:
+        """
+        Stamp ``dataset_metadata.updated_at`` with the current timestamp.
+
+        The table holds exactly one row per schema, so no ``WHERE`` clause is
+        needed. Failure is non-blocking: the timestamp is descriptive metadata and
+        must never invalidate an otherwise successful write.
+
+        Example:
+            >>> manager._touch_dataset_metadata()
+        """
+        try:
+            # Horodatage de la dernière écriture réussie.
+            # Valeur liée en Python plutôt que via now() : la colonne est un
+            # TIMESTAMP sans fuseau, là où now() renvoie un TIMESTAMP WITH TIME ZONE.
+            self.conn.execute(
+                f"UPDATE {self._qualified('dataset_metadata')} SET updated_at = ?",
+                [datetime.now()],
+            )
+        except Exception as e:
+            # Erreur non bloquante : l'horodatage ne conditionne pas l'écriture
+            self.logger.warning(f"Could not stamp dataset_metadata.updated_at: {e}")
 
     @abstractmethod
     def validate_operation(self, operation_type: str, **kwargs: Any) -> bool:

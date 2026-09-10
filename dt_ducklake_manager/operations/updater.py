@@ -13,7 +13,6 @@ from narwhals.typing import IntoDataFrame
 # Import des gestionnaires
 from .._internal.managers.base import BaseSchemaManager
 from .._internal.managers.data import DataManager
-from .._internal.managers.dimension import DimensionManager
 from .._internal.managers.transaction import TransactionManager, TransactionOperation
 from ..maintenance.auditor import DatabaseAuditor, IssueSeverity, ValidationLevel
 
@@ -38,7 +37,6 @@ class DatabaseUpdater(BaseSchemaManager):
     for different aspects of database operations.
 
     Attributes:
-        dimension_mgr (DimensionManager): Manages dimension table operations
         data_mgr (DataManager): Manages fact table operations
         transaction_mgr (TransactionManager): Manages transactions and rollback
         auditor (DatabaseAuditor): Validates database state and operations
@@ -91,15 +89,6 @@ class DatabaseUpdater(BaseSchemaManager):
         )
 
         # Initialisation des gestionnaires spécialisés
-        self.dimension_mgr = DimensionManager(
-            connection=connection,
-            categorical_threshold=categorical_threshold,
-            log_filename=log_filename,
-            max_workers=max_workers,
-            schema=schema,
-            catalog_alias=catalog_alias,
-        )
-
         self.data_mgr = DataManager(
             connection=connection,
             categorical_threshold=categorical_threshold,
@@ -279,7 +268,8 @@ class DatabaseUpdater(BaseSchemaManager):
         """Perform transactional database update with validation and rollback.
 
         Executes the update within a transaction, allowing rollback on failure.
-        Steps: preprocess → duplicate removal → metadata → fact table → dimensions.
+        Steps: preprocess → duplicate removal → metadata → fact table →
+        categorical flags.
 
         Args:
             update_df: DataFrame containing the update data.
@@ -367,8 +357,8 @@ class DatabaseUpdater(BaseSchemaManager):
                 self.transaction_mgr.rollback_transaction(tx_id)
                 return False
 
-            # Étape 4: Mise à jour de la table de faits (avant les dimensions pour
-            # refléter l'état actuel)
+            # Étape 4: Mise à jour de la table de faits (avant le recalcul du
+            # statut catégoriel, qui lit l'état post-upsert)
             # Mise à jour en batch si spécifié
             if use_batch_processing and len(update_df) > self.batch_size:
                 # Initialisation de l'opération de transaction
@@ -399,15 +389,15 @@ class DatabaseUpdater(BaseSchemaManager):
                 self.transaction_mgr.rollback_transaction(tx_id)
                 return False
 
-            # Étape 5: Mise à jour des tables de dimensions (après fact table pour
-            # refléter les données actuelles)
+            # Étape 5: Actualisation du statut catégoriel des colonnes VARCHAR
+            # (après la table de faits : le comptage porte sur l'état post-upsert)
             # Initialisation de l'opération de transaction
             operation = TransactionOperation(
-                operation_type="dimension_update",
-                operation_func=self._update_dimensions_safe,
-                operation_args=(update_df,),
-                rollback_func=self._rollback_dimension_changes,
-                description="Update dimension tables",
+                operation_type="categorical_flags",
+                operation_func=self._update_categorical_flags,
+                operation_args=(),
+                rollback_func=self._rollback_metadata_changes,
+                description="Refresh categorical flags in metadata",
             )
 
             # Annulation de la transaction si l'opération ne peut être ajoutée
@@ -416,24 +406,6 @@ class DatabaseUpdater(BaseSchemaManager):
                 return False
 
             # Annulation de la transaction si l'opération ne peut être exécutée
-            if not self.transaction_mgr.execute_operation(tx_id):
-                self.transaction_mgr.rollback_transaction(tx_id)
-                return False
-
-            # Étape 5b: Nettoyage des entrées orphelines dans les tables de dimension
-            cleanup_operation = TransactionOperation(
-                operation_type="dimension_cleanup",
-                operation_func=self.dimension_mgr.cleanup_orphaned_dimension_entries,
-                operation_args=(),
-                description="Clean orphaned dimension entries",
-            )
-
-            if not self.transaction_mgr.add_operation(
-                tx_id, **cleanup_operation.__dict__
-            ):
-                self.transaction_mgr.rollback_transaction(tx_id)
-                return False
-
             if not self.transaction_mgr.execute_operation(tx_id):
                 self.transaction_mgr.rollback_transaction(tx_id)
                 return False
@@ -461,6 +433,10 @@ class DatabaseUpdater(BaseSchemaManager):
                 self.logger.info("Database update completed successfully")
                 # Invalidation du cache
                 self._invalidate_metadata_cache()
+                # Horodatage de la dernière écriture réussie.
+                # Placé après le commit : un échec d'horodatage, purement
+                # descriptif, ne doit jamais annuler une écriture de données.
+                self._touch_dataset_metadata()
                 # Compaction DuckLake optionnelle après commit (fusion des petits
                 # fichiers delta)
                 if compact_after_update:
@@ -519,8 +495,8 @@ class DatabaseUpdater(BaseSchemaManager):
             if not self._update_metadata_safe(update_df):
                 return False
 
-            # Mise à jour de la table de faits (avant les dimensions pour refléter
-            # l'état actuel)
+            # Mise à jour de la table de faits (avant le recalcul du statut
+            # catégoriel, qui lit l'état post-upsert)
             # Mise à jour par batch si spécifié
             if use_batch_processing and len(update_df) > self.batch_size:
                 if not self._update_fact_table_batch(update_df):
@@ -529,13 +505,10 @@ class DatabaseUpdater(BaseSchemaManager):
                 if not self._update_fact_table_direct(update_df):
                     return False
 
-            # Mise à jour des tables de dimensions (après fact table pour refléter les
-            # données actuelles)
-            if not self._update_dimensions_safe(update_df):
+            # Actualisation du statut catégoriel des colonnes VARCHAR
+            # (le comptage porte sur l'état post-upsert de la table de faits)
+            if not self._update_categorical_flags():
                 return False
-
-            # Nettoyage des entrées orphelines dans les tables de dimension
-            self.dimension_mgr.cleanup_orphaned_dimension_entries()
 
             # Nettoyage final
             self._cleanup_orphaned_data()
@@ -544,6 +517,10 @@ class DatabaseUpdater(BaseSchemaManager):
             self.logger.info("Database update completed successfully (direct mode)")
             # Invalidation du cache des méta-données
             self._invalidate_metadata_cache()
+            # Horodatage de la dernière écriture réussie.
+            # Placé après le succès : un échec d'horodatage, purement descriptif,
+            # ne doit jamais annuler une écriture de données.
+            self._touch_dataset_metadata()
             # Compaction DuckLake optionnelle (fusion des petits fichiers delta)
             if compact_after_update:
                 self._run_ducklake_compaction()
@@ -586,116 +563,37 @@ class DatabaseUpdater(BaseSchemaManager):
             self.logger.error(f"Error updating metadata: {e}")
             return False
 
-    # Méthode auxiliaire de mise à jour des tables de dimension
-    def _update_dimensions_safe(self, update_df: nw.DataFrame[Any]) -> bool:
-        """Safely update dimension tables with categorical threshold checks.
+    # Méthode auxiliaire d'actualisation du statut catégoriel
+    def _update_categorical_flags(self) -> bool:
+        """Refresh the ``is_categorical`` flag of VARCHAR columns after an upsert.
 
-        Handles conversion between categorical and non-categorical status
-        based on unique value counts relative to the threshold.
-
-        Args:
-            update_df: DataFrame containing potential dimension updates.
+        The categorical status is pure UI metadata: it is recomputed from the
+        post-upsert distinct count of the fact table and compared against
+        ``categorical_threshold``. Only a plain ``UPDATE metadata`` is issued —
+        the fact table is never rewritten — and columns whose status was forced by
+        the producer are left untouched.
 
         Returns:
-            True if dimensions updated successfully, False on error.
+            True if the flags were refreshed (or nothing had to change), False on
+            error.
+
+        Examples:
+            >>> updater._update_categorical_flags()
+            True
         """
         try:
-            # Chargement des métadonnées
-            current_metadata = self._load_current_metadata()
-
-            # Classification des colonnes par statut catégoriel via filtrage narwhals
-            cat_names = current_metadata.filter(nw.col("is_categorical"))[
-                "name"
-            ].to_list()
-            # Colonnes non-catégorielles de type String (ex-'object' pandas) :
-            # candidates à conversion
-            non_cat_string_names = current_metadata.filter(
-                (~nw.col("is_categorical")) & (nw.col("python_type") == "String")
-            )["name"].to_list()
-
-            categorical_columns = {
-                col: update_df[col] for col in cat_names if col in update_df.columns
-            }
-            non_categorical_columns = {
-                col: update_df[col]
-                for col in non_cat_string_names
-                if col in update_df.columns
-            }
-
-            # Mise à jour des dimensions existantes
-            if categorical_columns:
-                results = self.dimension_mgr.batch_update_dimensions(
-                    categorical_columns,
-                    use_parallel=(
-                        len(categorical_columns) > 1 and self.max_workers > 1
-                    ),
+            # Délégation au recalcul partagé avec le gestionnaire de suppression
+            changed = self._refresh_categorical_flags()
+            # Logging
+            if changed:
+                self.logger.info(
+                    f"Categorical status refreshed for columns: {changed}"
                 )
-
-                # Vérification des résultats
-                for col_name, added_count in results.items():
-                    if added_count < 0:  # Erreur
-                        # Logging
-                        self.logger.error(f"Failed to update dimension for {col_name}")
-                        return False
-
-            # Vérification des conversions vers catégoriel pour les colonnes
-            # non-catégorielles
-            # La vérification porte sur l'état GLOBAL de fact_table après l'upsert, et
-            # non
-            # sur le seul update_df : un petit update_df pourrait avoir < seuil valeurs
-            # uniques
-            # pour une colonne qui en compte > seuil dans la base entière.
-            for col_name in non_categorical_columns.keys():
-                # Récupération des valeurs distinctes dans fact_table (état post-upsert)
-                db_values_series = nw.from_native(
-                    self.conn.execute(
-                        f"SELECT DISTINCT {quote_ident(col_name)} FROM"
-                        f" {self._qualified('fact_table')} WHERE"
-                        f" {quote_ident(col_name)} IS NOT NULL"
-                    ).pl()[col_name],
-                    series_only=True,
-                )
-                # Vérification du seuil sur l'ensemble complet des valeurs
-                if self._check_categorical_threshold(db_values_series):
-                    # Conversion en catégoriel (les valeurs DB sont passées pour créer
-                    # la dim table)
-                    if not self.dimension_mgr.convert_to_categorical(
-                        col_name, db_values_series
-                    ):
-                        # Logging
-                        self.logger.warning(
-                            f"Failed to convert {col_name} to categorical"
-                        )
-
-            # Vérification des conversions vers non-catégoriel pour les colonnes
-            # catégorielles
-            # La vérification porte sur le nombre d'entrées dans la table de dimension
-            # (état
-            # post-batch_update_dimensions), et non sur les seules valeurs de update_df.
-            for col_name in categorical_columns.keys():
-                # Comptage des entrées dans la table de dimension après
-                # batch_update_dimensions
-                _rd = self.conn.execute(
-                    f"SELECT COUNT(*) FROM {self._qualified(f'dim_{col_name}')}"
-                ).fetchone()
-                n_dim_entries = _rd[0] if _rd is not None else 0
-                # Vérification du seuil (garde contre un seuil non défini)
-                if (
-                    self.categorical_threshold is not None
-                    and n_dim_entries > self.categorical_threshold
-                ):
-                    # Conversion en non-catégoriel
-                    if not self.dimension_mgr.convert_to_non_categorical(col_name):
-                        # Logging
-                        self.logger.warning(
-                            f"Failed to convert {col_name} to non-categorical"
-                        )
-
             return True
 
         except Exception as e:
             # Logging
-            self.logger.error(f"Error updating dimensions: {e}")
+            self.logger.error(f"Error updating categorical flags: {e}")
             return False
 
     # Méthode auxiliaire de mise à jour directe de la table des faits
@@ -715,14 +613,13 @@ class DatabaseUpdater(BaseSchemaManager):
         """
         try:
             # Préparation des données pour la fact table
-            prepared_df = self._prepare_dataframe_for_fact_table(update_df)
 
             # Récupération des clés primaires depuis les métadonnées
             primary_keys = self._get_primary_key_columns()
 
             # Vérification que les clés primaires sont présentes dans le DataFrame
             missing_keys = [
-                key for key in primary_keys if key not in prepared_df.columns
+                key for key in primary_keys if key not in update_df.columns
             ]
             if missing_keys:
                 self.logger.error(f"Primary keys missing in DataFrame: {missing_keys}")
@@ -732,7 +629,7 @@ class DatabaseUpdater(BaseSchemaManager):
             # observations
             # existantes dont les valeurs doivent être mises à jour (UPSERT).
             rows_to_insert, rows_to_update = self._split_dataframe_by_pk_existence(
-                prepared_df, primary_keys
+                update_df, primary_keys
             )
 
             # Initialisation des nombres de données insérées et mises à jour
@@ -779,14 +676,13 @@ class DatabaseUpdater(BaseSchemaManager):
         """
         try:
             # Préparation des données pour la fact table
-            prepared_df = self._prepare_dataframe_for_fact_table(update_df)
 
             # Récupération des clés primaires depuis les métadonnées
             primary_keys = self._get_primary_key_columns()
 
             # Vérification que les clés primaires sont présentes dans le DataFrame
             missing_keys = [
-                key for key in primary_keys if key not in prepared_df.columns
+                key for key in primary_keys if key not in update_df.columns
             ]
             if missing_keys:
                 self.logger.error(f"Primary keys missing in DataFrame: {missing_keys}")
@@ -796,7 +692,7 @@ class DatabaseUpdater(BaseSchemaManager):
             # observations
             # existantes dont les valeurs doivent être mises à jour (UPSERT).
             rows_to_insert, rows_to_update = self._split_dataframe_by_pk_existence(
-                prepared_df, primary_keys
+                update_df, primary_keys
             )
 
             # Initialisation du nombre total de données mises à jour et insérées
@@ -982,22 +878,6 @@ class DatabaseUpdater(BaseSchemaManager):
             self.logger.error(f"Error rolling back metadata changes: {e}")
             return False
 
-    # Méthode auxiliaire de rollback des changements de dimensions
-    def _rollback_dimension_changes(self) -> bool:
-        """Rollback dimension table changes (handled by DuckDB transaction).
-
-        Returns:
-            True if rollback succeeded, False on error.
-        """
-        try:
-            # Les changements de dimension sont gérés par la transaction DuckDB
-            self.logger.info("Dimension changes rolled back")
-            return True
-        except Exception as e:
-            # Logging
-            self.logger.error(f"Error rolling back dimension changes: {e}")
-            return False
-
     # Méthode auxiliaire de rollback des changements de la fact table.
     def _rollback_fact_changes(self) -> bool:
         """Rollback fact table changes (handled by DuckDB transaction).
@@ -1016,98 +896,6 @@ class DatabaseUpdater(BaseSchemaManager):
             return False
 
     # Méthodes utilitaires
-    # Méthode auxiliaire de préparation du jeu de données pour la table des faits
-    def _prepare_dataframe_for_fact_table(
-        self, df: nw.DataFrame[Any]
-    ) -> nw.DataFrame[Any]:
-        """Prepare DataFrame for fact table insertion.
-
-        Converts categorical columns to their dimension table values
-        and handles unmapped values.
-
-        Args:
-            df: Original DataFrame to prepare.
-
-        Returns:
-            Prepared DataFrame with categorical columns mapped to dimension values.
-        """
-        try:
-            # Clonage du DataFrame (narwhals)
-            prepared_df = df.clone()
-
-            # Chargement des métadonnées
-            current_metadata = self._load_current_metadata()
-
-            # Extraction des colonnes catégorielles via filtrage narwhals
-            cat_names = current_metadata.filter(nw.col("is_categorical"))[
-                "name"
-            ].to_list()
-
-            # Conversion des colonnes catégorielles : label → valeur entière de
-            # dimension
-            for col_name in cat_names:
-                if col_name not in prepared_df.columns:
-                    continue
-
-                # Mise à jour préalable de la table de dimension avec les nouvelles
-                # valeurs
-                self.dimension_mgr.update_dimension_values(
-                    col_name, prepared_df[col_name]
-                )
-
-                # Récupération du mapping label → value (nw.DataFrame)
-                mapping_df = self.dimension_mgr.get_dimension_mapping(col_name)
-
-                if mapping_df is not None and len(mapping_df) > 0:
-                    label_to_value = dict(
-                        zip(
-                            mapping_df["label"].to_list(), mapping_df["value"].to_list()
-                        )
-                    )
-                    # Sauvegarde de l'ordre des colonnes
-                    original_columns = prepared_df.columns
-                    # Comptage des NULL avant le join : un NULL d'origine doit rester
-                    # NULL dans la fact_table (pas de pendant dans la dim_*) ; seuls
-                    # les NULL apparus *après* le join correspondent à des labels non
-                    # mappés (anomalie data qualité à signaler).
-                    pre_join_null_count = int(prepared_df[col_name].is_null().sum())
-                    # Jointure narwhals pour remplacer les labels par leurs IDs
-                    # Création du DataFrame de mapping avec le même backend que
-                    # prepared_df
-                    # pour éviter une incompatibilité lors du join narwhals.
-                    dim_nw = nw.from_dict(
-                        {
-                            "_lbl_": list(label_to_value.keys()),
-                            "_val_": list(label_to_value.values()),
-                        },
-                        backend=nw.get_native_namespace(prepared_df),
-                    )
-                    prepared_df = (
-                        prepared_df.rename({col_name: "_lbl_"})
-                        .join(dim_nw, on="_lbl_", how="left")
-                        .drop("_lbl_")
-                        .rename({"_val_": col_name})
-                        .select(original_columns)
-                    )
-
-                    # Diagnostic des valeurs non mappées : différence entre les NULL
-                    # post-join et les NULL d'entrée. Les NULL légitimes sont laissés
-                    # tels quels — ils ne doivent jamais avoir d'ID dans la dim_*.
-                    post_join_null_count = int(prepared_df[col_name].is_null().sum())
-                    unmapped_count = post_join_null_count - pre_join_null_count
-                    if unmapped_count > 0:
-                        self.logger.warning(
-                            f"Found {unmapped_count} unmapped (non-null) values in"
-                            f" {col_name}; they will be stored as NULL in fact_table"
-                        )
-
-            return prepared_df
-
-        except Exception as e:
-            # Logging
-            self.logger.error(f"Error preparing DataFrame for fact table: {e}")
-            return df
-
     # Méthode auxiliaire de suppression des doublons des données de mise à jour
     def _remove_update_duplicates(
         self,
@@ -1220,21 +1008,17 @@ class DatabaseUpdater(BaseSchemaManager):
     def _cleanup_orphaned_data(self) -> None:
         """Clean up orphaned data after update operations.
 
-        Removes orphaned dimension entries and drops null-only columns.
+        Drops columns of the fact table that hold only null values.
         """
         try:
-            # Nettoyage des entrées orphelines dans les dimensions
-            removed_counts = self.dimension_mgr.cleanup_orphaned_dimension_entries()
-
-            if removed_counts:
-                self.logger.info(
-                    f"Cleaned orphaned dimension entries: {removed_counts}"
-                )
-
-            # Suppression des colonnes ne contenant que des nulles
+            # Suppression des colonnes ne contenant que des nulles.
+            # La ligne de méta-données correspondante est retirée en même temps,
+            # faute de quoi metadata et fact_table divergeraient.
             null_only_columns = self._get_null_only_columns()
             if null_only_columns:
                 dropped_columns = self.data_mgr.drop_columns(null_only_columns)
+                for column in dropped_columns:
+                    self.delete_column_metadata(column)
                 if dropped_columns:
                     self.logger.info(f"Dropped null-only columns: {dropped_columns}")
 

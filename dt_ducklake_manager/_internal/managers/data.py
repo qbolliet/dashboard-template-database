@@ -28,7 +28,8 @@ class DataManager(BaseSchemaManager):
     Manages fact table operations including inserts, updates, upserts, and deletes.
 
     Handles data type management, column operations, and maintains consistency
-    with dimension tables. Provides batch processing capabilities for large datasets.
+    with the metadata table. Provides batch processing capabilities for large
+    datasets.
 
     Attributes:
         batch_size (int): Size of batches for processing large datasets
@@ -713,7 +714,8 @@ class DataManager(BaseSchemaManager):
 
                 if update_columns:
                     # Noms non-qualifiés côté gauche du SET : DuckDB rejette les
-                    # qualificateurs de table (f.col) dans la clause SET d'un UPDATE ... FROM.
+                    # qualificateurs de table (f.col) dans la clause SET d'un
+                    # UPDATE ... FROM.
                     set_clause = ", ".join(
                         f"{quote_ident(col)} = t.{quote_ident(col)}"
                         for col in update_columns

@@ -1,6 +1,49 @@
 # Importation des modules
 import narwhals as nw
 
+# Hiérarchie des types SQL : (niveau, largeur en bits).
+# Le niveau ordonne les familles (booléen < entier < flottant < texte) ; la largeur
+# ordonne les types d'un même niveau, garantissant qu'un BIGINT enregistré n'est
+# jamais rétrogradé par un lot d'Int32.
+# Les types non ordonnés (DECIMAL, DATE, TIMESTAMP, TIME, INTERVAL, BLOB) sont
+# volontairement absents : aucun élargissement n'a de sens entre eux et les types
+# ci-dessous, et les y rattacher promouvrait à tort une colonne temporelle en VARCHAR.
+SQL_TYPE_RANK: dict[str, tuple[int, int]] = {
+    # Niveau 1 : booléen
+    "BOOLEAN": (1, 1),
+    # Niveau 2 : entiers, ordonnés par largeur
+    "TINYINT": (2, 8),
+    "UTINYINT": (2, 8),
+    "SMALLINT": (2, 16),
+    "USMALLINT": (2, 16),
+    "INTEGER": (2, 32),
+    "UINTEGER": (2, 32),
+    "BIGINT": (2, 64),
+    "UBIGINT": (2, 64),
+    "HUGEINT": (2, 128),
+    "UHUGEINT": (2, 128),
+    # Niveau 3 : virgule flottante
+    "FLOAT": (3, 32),
+    "DOUBLE": (3, 64),
+    # Niveau 4 : texte
+    "VARCHAR": (4, 0),
+}
+
+# Types entiers non signés : à largeur égale, ils ne contiennent pas leur homologue
+# signé (INTEGER et UINTEGER se recouvrent partiellement seulement).
+UNSIGNED_SQL_TYPES: frozenset[str] = frozenset(
+    {"UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT"}
+)
+
+# Promotion en cas de conflit de signe : plus petit type signé contenant à la fois
+# le type signé et le type non signé de la largeur indiquée.
+SIGNED_WIDENING: dict[int, str] = {
+    8: "SMALLINT",
+    16: "INTEGER",
+    32: "BIGINT",
+    64: "HUGEINT",
+}
+
 
 # Fonction associant les types narwhals à leur équivalent SQL
 def map_python_to_sql_type(dtype: nw.dtypes.DType) -> str:
@@ -104,3 +147,60 @@ def map_python_to_sql_type(dtype: nw.dtypes.DType) -> str:
     # Cas de repli : Object, Unknown, et tout type non reconnu
     else:
         return "VARCHAR"
+
+
+# Fonction de résolution d'un conflit de types SQL entre la base et un lot entrant
+def resolve_sql_type_conflict(current: str, new: str) -> str | None:
+    """
+    Return the SQL type to store when a batch type differs from the stored one.
+
+    Widening only: the recorded type is never narrowed. Within a level the greater
+    width wins, so a stored ``BIGINT`` survives a batch of ``Int32``. At equal
+    width, a signed/unsigned clash is promoted to the smallest signed type holding
+    both. Non-ordered types (``DECIMAL``, ``DATE``, ``TIMESTAMP``, ``TIME``,
+    ``INTERVAL``, ``BLOB``) have no ordering and always keep the stored type.
+
+    Args:
+        current (str): SQL type currently recorded in ``metadata.sql_type``.
+        new (str): SQL type inferred from the incoming batch.
+
+    Returns:
+        str | None: The SQL type to write, or ``None`` when the stored type must
+        be kept.
+
+    Examples:
+        >>> resolve_sql_type_conflict('BIGINT', 'INTEGER') is None
+        True
+        >>> resolve_sql_type_conflict('INTEGER', 'BIGINT')
+        'BIGINT'
+        >>> resolve_sql_type_conflict('INTEGER', 'UINTEGER')
+        'BIGINT'
+        >>> resolve_sql_type_conflict('INTEGER', 'VARCHAR')
+        'VARCHAR'
+        >>> resolve_sql_type_conflict('TIMESTAMP', 'BIGINT') is None
+        True
+    """
+    # Types identiques : aucun conflit à résoudre
+    if current == new:
+        return None
+
+    # Rangs respectifs des deux types
+    current_rank = SQL_TYPE_RANK.get(current)
+    new_rank = SQL_TYPE_RANK.get(new)
+
+    # Type non ordonné d'un côté ou de l'autre : conservation du type enregistré
+    if current_rank is None or new_rank is None:
+        return None
+
+    # Comparaison lexicographique du couple (niveau, largeur)
+    if new_rank > current_rank:
+        return new
+    if new_rank < current_rank:
+        return None
+
+    # Niveau et largeur identiques : conflit de signe, promotion au type signé
+    # immédiatement supérieur (None en 128 bits, aucun entier plus large n'existant)
+    if (current in UNSIGNED_SQL_TYPES) != (new in UNSIGNED_SQL_TYPES):
+        return SIGNED_WIDENING.get(current_rank[1])
+
+    return None

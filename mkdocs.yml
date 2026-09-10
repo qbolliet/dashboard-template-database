@@ -117,7 +117,6 @@ nav:
     - managers:
       - BaseSchemaManager: api/_internal/managers/BaseSchemaManager.md
       - DataManager: api/_internal/managers/DataManager.md
-      - DimensionManager: api/_internal/managers/DimensionManager.md
       - TransactionState: api/_internal/managers/TransactionState.md
       - TransactionOperation: api/_internal/managers/TransactionOperation.md
       - TransactionContext: api/_internal/managers/TransactionContext.md

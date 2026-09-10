@@ -26,7 +26,7 @@ def test_full_schema_build_from_local_data(sample_df: pl.DataFrame) -> None:
     """Test the full schema build pipeline from a local DataFrame.
 
     Verifies that DuckLakeTablesBuilder creates all three layers of the schema
-    (metadata, dimension tables, fact table) from a sample polars DataFrame.
+    (fact_table, metadata, dataset_metadata) from a sample polars DataFrame.
 
     Args:
         sample_df: Sample polars DataFrame with categorical and numeric columns.
@@ -39,14 +39,27 @@ def test_full_schema_build_from_local_data(sample_df: pl.DataFrame) -> None:
         )
     builder.build_schema()
 
-    # Vérification de l'existence des tables attendues
+    # Vérification que le schéma contient exactement les trois tables attendues
     tables = [row[0] for row in builder.conn.execute("SHOW TABLES").fetchall()]
-    assert "metadata" in tables
-    assert "fact_table" in tables
-    # Vérification de la présence des tables de dimension pour les colonnes
-    # catégorielles
-    assert "dim_category" in tables
-    assert "dim_status" in tables
+    assert set(tables) == {"fact_table", "metadata", "dataset_metadata"}
+
+    # Vérification que les colonnes catégorielles portent bien les libellés d'origine
+    categories = [
+        row[0]
+        for row in builder.conn.execute(
+            "SELECT DISTINCT category FROM fact_table ORDER BY category"
+        ).fetchall()
+    ]
+    assert categories == ["A", "B", "C"]
+
+    # Vérification de la ligne unique de dataset_metadata
+    dataset_row = builder.conn.execute(
+        "SELECT schema_version, updated_at, cluster_by FROM dataset_metadata"
+    ).fetchall()
+    assert len(dataset_row) == 1
+    assert dataset_row[0][0] == 1
+    assert dataset_row[0][1] is not None
+    assert dataset_row[0][2] is None
 
     # Vérification que la fact table contient le bon nombre de lignes
     row_count_row = builder.conn.execute("SELECT COUNT(*) FROM fact_table").fetchone()
