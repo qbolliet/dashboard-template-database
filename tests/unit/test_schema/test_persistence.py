@@ -632,3 +632,90 @@ def test_two_schemas_coexist_in_one_catalog(
     shap_rows = shap_row[0]
     assert pred_rows == 3
     assert shap_rows == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests des champs d'UI de la table metadata (column_metadata)
+# ---------------------------------------------------------------------------
+
+
+# Test que le DDL de metadata porte les colonnes d'UI, toutes VARCHAR nullable
+def test_metadata_ddl_carries_ui_columns(
+    ducklake_builder: DuckLakeTablesBuilder,
+) -> None:
+    """Test that the metadata table DDL includes the nullable UI columns.
+
+    Args:
+        ducklake_builder: DuckLakeTablesBuilder fixture.
+    """
+    ducklake_builder.create_duckdb_metadata_table(table_name="test_metadata")
+
+    described = ducklake_builder.conn.execute("DESCRIBE test_metadata").fetchall()
+    columns = {row[0]: (row[1], row[2]) for row in described}
+
+    for field in (
+        "unit",
+        "display_format",
+        "family",
+        "description",
+        "default_aggregation",
+    ):
+        assert field in columns
+        # Type VARCHAR et colonne nullable
+        assert columns[field][0] == "VARCHAR"
+        assert columns[field][1] == "YES"
+
+
+# Test que build_schema écrit les valeurs de column_metadata dans la table
+def test_build_schema_writes_column_metadata(sample_df: pl.DataFrame) -> None:
+    """Test that build_schema persists the column_metadata values into metadata.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        builder = DuckLakeTablesBuilder(sample_df, categorical_threshold=4)
+
+    builder.build_schema(
+        column_metadata={
+            "value": {
+                "unit": "%",
+                "display_format": ".0%",
+                "family": "scores",
+                "description": "prediction score",
+                "default_aggregation": "median",
+            }
+        }
+    )
+
+    row = builder.conn.execute(
+        "SELECT unit, display_format, family, description, default_aggregation"
+        " FROM metadata WHERE name = 'value'"
+    ).fetchone()
+    assert row == ("%", ".0%", "scores", "prediction score", "MEDIAN")
+
+    # Une colonne non renseignée conserve des champs d'UI nuls
+    other = builder.conn.execute(
+        "SELECT unit, default_aggregation FROM metadata WHERE name = 'category'"
+    ).fetchone()
+    assert other == (None, None)
+
+
+# Test que build_schema propage l'erreur de validation de default_aggregation
+def test_build_schema_invalid_default_aggregation_raises(
+    sample_df: pl.DataFrame,
+) -> None:
+    """Test that an invalid default_aggregation aborts build_schema with ValueError.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        builder = DuckLakeTablesBuilder(sample_df, categorical_threshold=4)
+
+    with pytest.raises(ValueError, match="Invalid default_aggregation"):
+        builder.build_schema(
+            column_metadata={"value": {"default_aggregation": "SOMME"}}
+        )

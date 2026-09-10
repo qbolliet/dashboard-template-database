@@ -437,3 +437,146 @@ def test_all_null_rows_preserved_as_null_in_fact_table() -> None:
     # Les positions non nulles conservent leur libellé d'origine
     assert status_values[0] == "active"
     assert status_values[2] == "inactive"
+
+
+# ---------------------------------------------------------------------------
+# Tests de column_metadata (champs d'UI de la table metadata)
+# ---------------------------------------------------------------------------
+
+
+# Test de la propagation des champs d'UI vers la table de métadonnées
+def test_column_metadata_populates_ui_fields(schema_builder: Any) -> None:
+    """Test that column_metadata fills the UI fields and upper-cases the aggregation.
+
+    Args:
+        schema_builder: SchemaBuilder fixture.
+    """
+    metadata = schema_builder.create_metadata_table(
+        column_metadata={
+            "value": {
+                "unit": "€",
+                "display_format": ",.2f",
+                "family": "kpi",
+                "description": "the observed value",
+                "default_aggregation": "sum",
+            }
+        }
+    )
+
+    # Toutes les colonnes d'UI sont présentes dans la table
+    for field in (
+        "unit",
+        "display_format",
+        "family",
+        "description",
+        "default_aggregation",
+    ):
+        assert field in metadata.columns
+
+    row = metadata.filter(nw.col("name") == "value")
+    assert row["unit"][0] == "€"
+    assert row["display_format"][0] == ",.2f"
+    assert row["family"][0] == "kpi"
+    assert row["description"][0] == "the observed value"
+    # Normalisation en majuscules à l'écriture
+    assert row["default_aggregation"][0] == "SUM"
+
+
+# Test que les colonnes non renseignées portent NULL sur les champs d'UI
+def test_column_metadata_absent_columns_are_null(schema_builder: Any) -> None:
+    """Test that columns not referenced in column_metadata keep NULL UI fields.
+
+    Args:
+        schema_builder: SchemaBuilder fixture.
+    """
+    metadata = schema_builder.create_metadata_table(
+        column_metadata={"value": {"unit": "€"}}
+    )
+
+    # La colonne 'id' n'est pas référencée : tous ses champs d'UI restent nuls
+    id_row = metadata.filter(nw.col("name") == "id")
+    for field in (
+        "unit",
+        "display_format",
+        "family",
+        "description",
+        "default_aggregation",
+    ):
+        assert id_row[field][0] is None
+
+
+# Test du renseignement partiel des champs d'UI
+def test_column_metadata_partial_fields(schema_builder: Any) -> None:
+    """Test that only the supplied UI fields are set, the others staying NULL.
+
+    Args:
+        schema_builder: SchemaBuilder fixture.
+    """
+    metadata = schema_builder.create_metadata_table(
+        column_metadata={"value": {"unit": "MW", "default_aggregation": "avg"}}
+    )
+
+    row = metadata.filter(nw.col("name") == "value")
+    assert row["unit"][0] == "MW"
+    assert row["default_aggregation"][0] == "AVG"
+    # Champs non fournis : NULL
+    assert row["display_format"][0] is None
+    assert row["family"][0] is None
+    assert row["description"][0] is None
+
+
+# Test que column_metadata prime sur column_labels pour le libellé
+def test_column_metadata_label_wins_over_column_labels(schema_builder: Any) -> None:
+    """Test that a label given in column_metadata overrides column_labels.
+
+    Args:
+        schema_builder: SchemaBuilder fixture.
+    """
+    metadata = schema_builder.create_metadata_table(
+        column_labels={"value": "From column_labels"},
+        column_metadata={"value": {"label": "From column_metadata"}},
+    )
+
+    label = metadata.filter(nw.col("name") == "value")["label"][0]
+    assert label == "From column_metadata"
+
+
+# Test qu'une colonne inconnue dans column_metadata lève une ValueError
+def test_column_metadata_unknown_column_raises(schema_builder: Any) -> None:
+    """Test that referencing a missing column in column_metadata raises ValueError.
+
+    Args:
+        schema_builder: SchemaBuilder fixture.
+    """
+    with pytest.raises(ValueError, match="do not exist in the DataFrame"):
+        schema_builder.create_metadata_table(
+            column_metadata={"not_a_column": {"unit": "€"}}
+        )
+
+
+# Test qu'une clé inconnue dans un sous-dictionnaire lève une ValueError listant la clé
+def test_column_metadata_unknown_key_raises(schema_builder: Any) -> None:
+    """Test that an unknown sub-dictionary key raises a ValueError listing it.
+
+    Args:
+        schema_builder: SchemaBuilder fixture.
+    """
+    with pytest.raises(ValueError, match="Unknown column_metadata key.*'color'"):
+        schema_builder.create_metadata_table(
+            column_metadata={"value": {"unit": "€", "color": "red"}}
+        )
+
+
+# Test qu'une agrégation par défaut invalide lève une ValueError
+def test_column_metadata_invalid_default_aggregation_raises(
+    schema_builder: Any,
+) -> None:
+    """Test that an invalid default_aggregation raises a ValueError.
+
+    Args:
+        schema_builder: SchemaBuilder fixture.
+    """
+    with pytest.raises(ValueError, match="Invalid default_aggregation"):
+        schema_builder.create_metadata_table(
+            column_metadata={"value": {"default_aggregation": "TOTAL"}}
+        )

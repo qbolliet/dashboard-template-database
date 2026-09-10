@@ -489,6 +489,11 @@ class DatabaseAuditor:
                 "is_categorical",
                 "is_categorical_forced",
                 "is_primary_key",
+                "unit",
+                "display_format",
+                "family",
+                "description",
+                "default_aggregation",
             ]
             missing_columns = [
                 col for col in required_columns if col not in metadata_df.columns

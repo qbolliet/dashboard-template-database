@@ -491,3 +491,131 @@ def test_metadata_isolated_by_schema(
     assert "value" not in shap_columns
     assert "shap_value" in shap_columns
     assert "shap_value" not in pred_columns
+
+
+# ===========================================================================
+# Tests des champs d'UI de la table metadata
+# ===========================================================================
+
+
+# Test que _add_column_to_metadata insère NULL sur les champs d'UI
+def test_add_column_to_metadata_inserts_null_ui_fields(manager: DataManager) -> None:
+    """Test that a newly discovered column gets NULL UI metadata fields.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    df = pl.DataFrame({"id": [1, 2, 3], "score": [0.1, 0.2, 0.3]})
+    manager._add_column_to_metadata("score", df)
+
+    row = manager.conn.execute(
+        "SELECT unit, display_format, family, description, default_aggregation"
+        " FROM metadata WHERE name = 'score'"
+    ).fetchone()
+    assert row == (None, None, None, None, None)
+
+
+# Test que update_column_metadata renseigne les champs et invalide le cache
+def test_update_column_metadata_sets_fields(manager: DataManager) -> None:
+    """Test that update_column_metadata writes the fields and refreshes the cache.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    # Amorçage du cache
+    _ = manager._load_current_metadata()
+
+    manager.update_column_metadata(
+        "value",
+        unit="€",
+        display_format=",.2f",
+        family="kpi",
+        description="the value",
+        default_aggregation="sum",
+    )
+
+    row = manager.conn.execute(
+        "SELECT unit, display_format, family, description, default_aggregation"
+        " FROM metadata WHERE name = 'value'"
+    ).fetchone()
+    assert row == ("€", ",.2f", "kpi", "the value", "SUM")
+
+    # Le cache a été invalidé : la relecture reflète la mise à jour
+    reloaded = manager._load_current_metadata()
+    agg = reloaded.filter(nw.col("name") == "value")["default_aggregation"][0]
+    assert agg == "SUM"
+
+
+# Test que update_column_metadata peut aussi corriger le libellé
+def test_update_column_metadata_updates_label(manager: DataManager) -> None:
+    """Test that update_column_metadata can also fix the display label.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    manager.update_column_metadata("value", label="Corrected Label")
+    row = manager.conn.execute(
+        "SELECT label FROM metadata WHERE name = 'value'"
+    ).fetchone()
+    assert row[0] == "Corrected Label"
+
+
+# Test que update_column_metadata sur une colonne absente lève une ValueError
+def test_update_column_metadata_missing_column_raises(manager: DataManager) -> None:
+    """Test that update_column_metadata raises on a column absent from metadata.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    with pytest.raises(ValueError, match="no row in the metadata table"):
+        manager.update_column_metadata("not_a_column", unit="€")
+
+
+# Test que update_column_metadata rejette un champ non autorisé
+def test_update_column_metadata_unknown_field_raises(manager: DataManager) -> None:
+    """Test that update_column_metadata rejects a field outside the allowed set.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    with pytest.raises(ValueError, match="Unknown metadata field.*'sql_type'"):
+        manager.update_column_metadata("value", sql_type="DOUBLE")
+
+
+# Test que update_column_metadata valide default_aggregation
+def test_update_column_metadata_invalid_aggregation_raises(
+    manager: DataManager,
+) -> None:
+    """Test that update_column_metadata validates default_aggregation.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    with pytest.raises(ValueError, match="Invalid default_aggregation"):
+        manager.update_column_metadata("value", default_aggregation="TOTAL")
+
+
+# Test que _add_column_to_metadata préserve les champs d'UI d'une colonne existante
+def test_add_column_to_metadata_preserves_ui_fields_on_update(
+    manager: DataManager,
+) -> None:
+    """Test that refreshing an existing metadata row keeps its UI fields intact.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    # Renseignement initial des champs d'UI par le producteur
+    manager.update_column_metadata(
+        "value", unit="€", display_format=",.2f", default_aggregation="sum"
+    )
+
+    # Nouvel appel simulant un update de données (type inchangé)
+    df = pl.DataFrame({"id": [1], "value": [9.9]})
+    manager._add_column_to_metadata("value", df)
+
+    row = manager.conn.execute(
+        "SELECT unit, display_format, default_aggregation"
+        " FROM metadata WHERE name = 'value'"
+    ).fetchone()
+    # Les champs d'UI ne sont pas remis à NULL
+    assert row == ("€", ",.2f", "SUM")

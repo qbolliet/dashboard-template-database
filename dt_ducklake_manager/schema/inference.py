@@ -11,7 +11,72 @@ from narwhals.typing import IntoDataFrame
 from ..utils.logger import _init_logger
 
 # Utilitaires de traitement des données
-from ..utils.types import map_python_to_sql_type
+from ..utils.types import (
+    COLUMN_METADATA_KEYS,
+    UI_METADATA_FIELDS,
+    map_python_to_sql_type,
+    normalize_default_aggregation,
+)
+
+
+# Fonction de validation du dictionnaire ``column_metadata``
+def _validate_column_metadata(
+    column_metadata: dict[str, dict[str, str]] | None,
+    columns: list[str],
+) -> dict[str, dict[str, str | None]]:
+    """
+    Validate and normalize a ``column_metadata`` mapping.
+
+    Args:
+        column_metadata: Mapping of column name to a sub-dictionary of UI fields
+            (``label``, ``unit``, ``display_format``, ``family``, ``description``,
+            ``default_aggregation``), all keys optional. ``None`` yields an empty
+            mapping.
+        columns: Column names available in the source DataFrame.
+
+    Returns:
+        dict[str, dict[str, str | None]]: The mapping with ``default_aggregation``
+        upper-cased, ready to be consumed by the builder.
+
+    Raises:
+        ValueError: If a referenced column is absent from ``columns``, if a
+            sub-dictionary carries an unknown key, or if ``default_aggregation`` is
+            not an allowed value.
+
+    Examples:
+        >>> _validate_column_metadata({'a': {'unit': '€'}}, ['a'])
+        {'a': {'unit': '€'}}
+    """
+    # Absence de métadonnées d'UI : mapping vide
+    if not column_metadata:
+        return {}
+
+    # Vérification de l'existence des colonnes référencées
+    unknown_cols = set(column_metadata) - set(columns)
+    if unknown_cols:
+        raise ValueError(
+            f"The following column_metadata columns do not exist in the DataFrame: "
+            f"{sorted(unknown_cols)}"
+        )
+
+    # Contrôle des clés de chaque sous-dictionnaire et normalisation de l'agrégation
+    normalized: dict[str, dict[str, str | None]] = {}
+    for col, fields in column_metadata.items():
+        unknown_keys = set(fields) - COLUMN_METADATA_KEYS
+        if unknown_keys:
+            raise ValueError(
+                f"Unknown column_metadata key(s) for column {col!r}: "
+                f"{sorted(unknown_keys)}; allowed keys are "
+                f"{sorted(COLUMN_METADATA_KEYS)}"
+            )
+        col_fields: dict[str, str | None] = dict(fields)
+        if "default_aggregation" in col_fields:
+            col_fields["default_aggregation"] = normalize_default_aggregation(
+                col_fields["default_aggregation"]
+            )
+        normalized[col] = col_fields
+
+    return normalized
 
 
 # Classe de création d'une base de données DuckDB avec :
@@ -149,58 +214,84 @@ class SchemaBuilder:
 
     # Méthode inférant le type des colonnes du jeu de données
     def create_metadata_table(
-        self, column_labels: dict[str, str] | None | None = None
+        self,
+        column_labels: dict[str, str] | None | None = None,
+        column_metadata: dict[str, dict[str, str]] | None = None,
     ) -> nw.DataFrame[Any]:
         """
         Automatically infer metadata for the DataFrame's columns, including SQL types,
-        labels, and the categorical UI flag.
+        labels, the categorical UI flag and the producer-owned UI fields.
 
         The ``is_categorical`` flag is inferred from the cardinality of textual
         columns and can be forced per column through ``categorical_overrides``; a
         forced column carries ``is_categorical_forced = True`` so that no later
         update re-evaluates it.
 
+        The UI fields ``unit``, ``display_format``, ``family``, ``description`` and
+        ``default_aggregation`` are all VARCHAR, nullable, and default to ``None``.
+        They are supplied per column through ``column_metadata``.
+
         Args:
             column_labels (dict, optional): A dictionary mapping column names to labels.
                                             Defaults to None.
+            column_metadata (dict, optional): Mapping of column name to a
+                sub-dictionary with optional keys ``label``, ``unit``,
+                ``display_format`` (a d3-format string), ``family``, ``description``
+                and ``default_aggregation`` (one of ``SUM``, ``AVG``, ``MIN``,
+                ``MAX``, ``COUNT``, ``MEDIAN``, ``MODE``, validated on write). When a
+                label is given both here and in ``column_labels``, this mapping wins.
+                Defaults to None.
 
         Returns:
             nw.DataFrame: A DataFrame containing metadata for each column in the input
             dataset.
 
+        Raises:
+            ValueError: If ``column_metadata`` references a column absent from the
+                DataFrame, carries an unknown sub-dictionary key, or supplies an
+                invalid ``default_aggregation``.
+
         Examples:
             >>> metadata = builder.create_metadata_table()
             >>> sorted(metadata.columns)  # doctest: +NORMALIZE_WHITESPACE
-            ['is_categorical', 'is_categorical_forced', 'is_primary_key', 'label',
-             'name', 'sql_type']
+            ['default_aggregation', 'description', 'display_format', 'family',
+             'is_categorical', 'is_categorical_forced', 'is_primary_key', 'label',
+             'name', 'sql_type', 'unit']
         """
+        # Validation et normalisation des métadonnées d'UI fournies par le producteur
+        column_metadata_norm = _validate_column_metadata(
+            column_metadata, list(self.df.columns)
+        )
+
         # Initialisation de la liste des méta-données
         list_metadata = []
         # Parcours des colonnes du jeu de données
         for col in self.df.columns:
             # Extraction du type de la colonne (narwhals DType)
             dtype_obj = self.df.schema[col]
-            # Initialisation des méta-données associées à la colonne
-            if column_labels is not None:
-                metadata = {
-                    "name": col,
-                    "label": column_labels[col]
-                    if col in column_labels.keys()
-                    else col.replace("_", " ").title(),
-                    "sql_type": map_python_to_sql_type(dtype_obj),
-                    "is_categorical": False,
-                    "is_categorical_forced": False,
-                    "is_primary_key": col in self.primary_keys,
-                }
+            # Sous-dictionnaire d'UI éventuel pour la colonne courante
+            ui_fields = column_metadata_norm.get(col, {})
+            # Résolution du libellé : column_metadata prime sur column_labels, qui
+            # prime sur le libellé dérivé du nom technique.
+            if "label" in ui_fields and ui_fields["label"] is not None:
+                label = ui_fields["label"]
+            elif column_labels is not None and col in column_labels:
+                label = column_labels[col]
             else:
-                metadata = {
-                    "name": col,
-                    "label": col.replace("_", " ").title(),
-                    "sql_type": map_python_to_sql_type(dtype_obj),
-                    "is_categorical": False,
-                    "is_categorical_forced": False,
-                    "is_primary_key": col in self.primary_keys,
-                }
+                label = col.replace("_", " ").title()
+
+            # Initialisation des méta-données associées à la colonne
+            metadata = {
+                "name": col,
+                "label": label,
+                "sql_type": map_python_to_sql_type(dtype_obj),
+                "is_categorical": False,
+                "is_categorical_forced": False,
+                "is_primary_key": col in self.primary_keys,
+            }
+            # Champs d'UI : valeur fournie ou NULL par défaut
+            for field in UI_METADATA_FIELDS:
+                metadata[field] = ui_fields.get(field)
 
             # Logging
             self.logger.info(f"Successfully extracted meta-data from column '{col}'")
@@ -259,6 +350,13 @@ class SchemaBuilder:
             col_oriented, backend=nw.get_native_namespace(self.df)
         ).sort("label")
 
+        # Typage explicite des champs d'UI en VARCHAR : une colonne entièrement NULL
+        # serait sinon inférée en type ``Null`` par le backend, incompatible avec le
+        # DDL VARCHAR de la table metadata.
+        self.df_metadata = self.df_metadata.with_columns(
+            nw.col(field).cast(nw.String) for field in UI_METADATA_FIELDS
+        )
+
         # Logging
         self.logger.info("Successfully built the meta-data DataFrame")
 
@@ -298,7 +396,9 @@ class SchemaBuilder:
 
     # Méthode créant les différentes tables
     def build(
-        self, column_labels: dict[str, str] | None | None = None
+        self,
+        column_labels: dict[str, str] | None | None = None,
+        column_metadata: dict[str, dict[str, str]] | None = None,
     ) -> tuple[nw.DataFrame[Any], nw.DataFrame[Any]]:
         """
         Execute the full pipeline to create the metadata and fact tables.
@@ -306,6 +406,8 @@ class SchemaBuilder:
         Args:
             column_labels (dict, optional): A dictionary mapping column names to labels.
                                             Defaults to None.
+            column_metadata (dict, optional): Per-column UI metadata forwarded to
+                :meth:`create_metadata_table`. Defaults to None.
 
         Returns:
             tuple: A tuple containing the metadata DataFrame and the fact table
@@ -317,7 +419,9 @@ class SchemaBuilder:
             True
         """
         # Création de la table des méta-données
-        _ = self.create_metadata_table(column_labels=column_labels)
+        _ = self.create_metadata_table(
+            column_labels=column_labels, column_metadata=column_metadata
+        )
         # Création de la table des faits
         _ = self.create_fact_table(column_labels=column_labels)
 

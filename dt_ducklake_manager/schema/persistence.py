@@ -188,6 +188,7 @@ class DuckLakeTablesBuilder:
         self,
         table_name: str | None = "metadata",
         column_labels: dict[str, str] | None = None,
+        column_metadata: dict[str, dict[str, str]] | None = None,
     ) -> None:
         """
         Create the metadata table in DuckDB, one row per fact table column.
@@ -197,6 +198,11 @@ class DuckLakeTablesBuilder:
                 to 'metadata'.
             column_labels (Optional[Dict[str, str]]): Optional mapping of column names
                 to labels.
+            column_metadata (Optional[Dict[str, Dict[str, str]]]): Optional per-column
+                UI metadata (``label``, ``unit``, ``display_format``, ``family``,
+                ``description``, ``default_aggregation``). Forwarded to
+                ``SchemaBuilder.create_metadata_table``; ``column_metadata`` wins over
+                ``column_labels`` when both carry a label for the same column.
 
         Examples:
             >>> builder.create_duckdb_metadata_table()
@@ -204,7 +210,9 @@ class DuckLakeTablesBuilder:
         """
         # Création de la table des méta-données si elle n'existe pas déjà
         if not hasattr(self.schema_builder, "df_metadata"):
-            _ = self.schema_builder.create_metadata_table(column_labels)
+            _ = self.schema_builder.create_metadata_table(
+                column_labels, column_metadata
+            )
 
         # Création de la table avec schéma explicite
         # L'unicité de 'name' est garantie applicativement par DuckdbTablesBuilder.
@@ -229,7 +237,12 @@ class DuckLakeTablesBuilder:
                 sql_type VARCHAR,
                 is_categorical BOOLEAN,
                 is_categorical_forced BOOLEAN,
-                is_primary_key BOOLEAN
+                is_primary_key BOOLEAN,
+                unit VARCHAR,
+                display_format VARCHAR,
+                family VARCHAR,
+                description VARCHAR,
+                default_aggregation VARCHAR
             )
         """)
 
@@ -239,9 +252,11 @@ class DuckLakeTablesBuilder:
         self.conn.execute(f"""
             INSERT INTO {qualified_name}
                 (name, label, sql_type, is_categorical, is_categorical_forced,
-                 is_primary_key)
+                 is_primary_key, unit, display_format, family, description,
+                 default_aggregation)
             SELECT name, label, sql_type, is_categorical, is_categorical_forced,
-                   is_primary_key
+                   is_primary_key, unit, display_format, family, description,
+                   default_aggregation
             FROM temp_metadata
         """)
         self.conn.execute("DROP VIEW temp_metadata")
@@ -429,6 +444,7 @@ class DuckLakeTablesBuilder:
         fact_table: str | None = "fact_table",
         dataset_metadata_table: str | None = "dataset_metadata",
         column_labels: dict[str, str] | None = None,
+        column_metadata: dict[str, dict[str, str]] | None = None,
         check_duplicates: bool = True,
         keep: Literal["any", "none", "first", "last"] = "none",
         partition_by: list[str] | None = None,
@@ -446,6 +462,10 @@ class DuckLakeTablesBuilder:
                 table. Defaults to 'dataset_metadata'.
             column_labels (Optional[Dict[str, str]]): Optional mapping of column names
                 to labels.
+            column_metadata (Optional[Dict[str, Dict[str, str]]]): Optional per-column
+                UI metadata (``label``, ``unit``, ``display_format``, ``family``,
+                ``description``, ``default_aggregation``), written into the metadata
+                table. Defaults to None.
             check_duplicates (bool): Whether to check and remove duplicates. Defaults to
                 True.
             keep (Literal['any', 'none', 'first', 'last']): Which duplicates to keep.
@@ -497,7 +517,9 @@ class DuckLakeTablesBuilder:
 
         # Création de la table des méta-données
         self.create_duckdb_metadata_table(
-            table_name=metadata_table, column_labels=column_labels
+            table_name=metadata_table,
+            column_labels=column_labels,
+            column_metadata=column_metadata,
         )
 
         # Création de la table d'informations avec partitionnement optionnel

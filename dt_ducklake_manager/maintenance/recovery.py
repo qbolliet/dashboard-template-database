@@ -881,7 +881,12 @@ class DatabaseRecoveryManager:
                         sql_type VARCHAR,
                         is_categorical BOOLEAN,
                         is_categorical_forced BOOLEAN DEFAULT FALSE,
-                        is_primary_key BOOLEAN DEFAULT FALSE
+                        is_primary_key BOOLEAN DEFAULT FALSE,
+                        unit VARCHAR,
+                        display_format VARCHAR,
+                        family VARCHAR,
+                        description VARCHAR,
+                        default_aggregation VARCHAR
                     )
                 """)
                 self.logger.info("Created missing metadata table")
@@ -918,6 +923,11 @@ class DatabaseRecoveryManager:
                 "is_categorical": "BOOLEAN",
                 "is_categorical_forced": "BOOLEAN DEFAULT FALSE",
                 "is_primary_key": "BOOLEAN DEFAULT FALSE",
+                "unit": "VARCHAR",
+                "display_format": "VARCHAR",
+                "family": "VARCHAR",
+                "description": "VARCHAR",
+                "default_aggregation": "VARCHAR",
             }
 
             # Nom qualifié de la table de métadonnées

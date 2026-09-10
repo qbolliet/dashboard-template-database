@@ -8,7 +8,11 @@ import pytest
 from narwhals.dtypes import DType
 
 # Module du package à tester
-from dt_ducklake_manager.utils.types import map_python_to_sql_type
+from dt_ducklake_manager.utils.types import (
+    ALLOWED_DEFAULT_AGGREGATIONS,
+    map_python_to_sql_type,
+    normalize_default_aggregation,
+)
 
 # ---------------------------------------------------------------------------
 # Tests des types textuels
@@ -292,3 +296,45 @@ def test_map_via_polars_float_schema() -> None:
     df = pl.DataFrame({"col": [1.0, 2.0]})
     nw_df = nw.from_native(df, eager_only=True)
     assert map_python_to_sql_type(nw_df.schema["col"]) == "DOUBLE"
+
+
+# ---------------------------------------------------------------------------
+# Tests de normalize_default_aggregation()
+# ---------------------------------------------------------------------------
+
+
+# Test de la normalisation en majuscules d'une agrégation valide
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("sum", "SUM"),
+        ("Avg", "AVG"),
+        ("MEDIAN", "MEDIAN"),
+        ("mode", "MODE"),
+        ("count", "COUNT"),
+        ("min", "MIN"),
+        ("max", "MAX"),
+    ],
+)
+def test_normalize_default_aggregation_valid(raw: str, expected: str) -> None:
+    """Test that a valid aggregation is upper-cased and returned.
+
+    Args:
+        raw: Case-insensitive aggregation label supplied by the producer.
+        expected: Canonical upper-cased label.
+    """
+    assert normalize_default_aggregation(raw) == expected
+    assert expected in ALLOWED_DEFAULT_AGGREGATIONS
+
+
+# Test que None traverse la fonction sans validation (champ nullable)
+def test_normalize_default_aggregation_none_passes_through() -> None:
+    """Test that None is accepted unchanged since the field is nullable."""
+    assert normalize_default_aggregation(None) is None
+
+
+# Test qu'une agrégation inconnue lève une ValueError explicite
+def test_normalize_default_aggregation_invalid_raises() -> None:
+    """Test that an unsupported aggregation raises a descriptive ValueError."""
+    with pytest.raises(ValueError, match="Invalid default_aggregation 'TOTAL'"):
+        normalize_default_aggregation("TOTAL")

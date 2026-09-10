@@ -15,7 +15,12 @@ from narwhals.typing import IntoDataFrame
 # Import des utilitaires
 from ...utils.logger import _init_logger
 from ...utils.sql import qualify_table, quote_ident, resolve_catalog
-from ...utils.types import map_python_to_sql_type, resolve_sql_type_conflict
+from ...utils.types import (
+    COLUMN_METADATA_KEYS,
+    map_python_to_sql_type,
+    normalize_default_aggregation,
+    resolve_sql_type_conflict,
+)
 
 
 # Classe contenant des opérations utilitaires de base sur la base de données au schéma
@@ -159,6 +164,11 @@ class BaseSchemaManager(ABC):
                                 "is_categorical": pl.Boolean,
                                 "is_categorical_forced": pl.Boolean,
                                 "is_primary_key": pl.Boolean,
+                                "unit": pl.String,
+                                "display_format": pl.String,
+                                "family": pl.String,
+                                "description": pl.String,
+                                "default_aggregation": pl.String,
                             }
                         ),
                         eager_only=True,
@@ -360,7 +370,12 @@ class BaseSchemaManager(ABC):
                 sql_type VARCHAR,
                 is_categorical BOOLEAN,
                 is_categorical_forced BOOLEAN DEFAULT FALSE,
-                is_primary_key BOOLEAN DEFAULT FALSE
+                is_primary_key BOOLEAN DEFAULT FALSE,
+                unit VARCHAR,
+                display_format VARCHAR,
+                family VARCHAR,
+                description VARCHAR,
+                default_aggregation VARCHAR
             )
         """)
 
@@ -374,7 +389,10 @@ class BaseSchemaManager(ABC):
         if existing_count == 0:
             # Colonne absente : insertion.
             # Libellé par défaut dérivé du nom technique, statut jamais forcé (la
-            # colonne est découverte, pas déclarée par le producteur).
+            # colonne est découverte, pas déclarée par le producteur). Les champs
+            # d'UI (unit, display_format, family, description, default_aggregation)
+            # ne sont pas listés : ils prennent donc NULL, seul le producteur de
+            # métadonnées pouvant les renseigner via update_column_metadata.
             insert_label = (
                 label if label is not None else column.replace("_", " ").title()
             )
@@ -389,7 +407,9 @@ class BaseSchemaManager(ABC):
         else:
             # Colonne déjà présente : mise à jour des seuls champs dérivés des données.
             # COALESCE préserve un libellé déjà renseigné par le producteur ; le CASE
-            # protège un statut catégoriel explicitement forcé.
+            # protège un statut catégoriel explicitement forcé. Les champs d'UI ne
+            # sont jamais touchés ici : un update de données ne doit pas les remettre
+            # à NULL.
             self.conn.execute(
                 f"""
                 UPDATE {metadata_table}
@@ -407,6 +427,81 @@ class BaseSchemaManager(ABC):
 
         # Logging
         self.logger.info(f"Added/updated column {column} in metadata")
+
+    # Méthode de renseignement ou de correction des champs d'UI d'une colonne
+    def update_column_metadata(self, column: str, **fields: str | None) -> None:
+        """
+        Set or correct the producer-owned UI fields of an existing column.
+
+        Only ``label``, ``unit``, ``display_format``, ``family``, ``description`` and
+        ``default_aggregation`` may be updated. The update touches nothing else, so a
+        later data update never has to rebuild the base to fix a wrong unit or
+        format. ``default_aggregation`` is validated (and upper-cased) before the
+        write.
+
+        Args:
+            column: Name of the column, which must already have a row in the
+                metadata table.
+            **fields: Field/value pairs among ``label``, ``unit``,
+                ``display_format``, ``family``, ``description`` and
+                ``default_aggregation``. A value of ``None`` clears the field.
+
+        Raises:
+            ValueError: If a field name is not one of the allowed fields, if
+                ``default_aggregation`` is invalid, or if the column has no row in
+                the metadata table.
+
+        Example:
+            >>> manager.update_column_metadata(
+            ...     'value', unit='€', display_format=',.2f',
+            ...     default_aggregation='sum')
+        """
+        # Contrôle des champs autorisés
+        unknown = set(fields) - COLUMN_METADATA_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown metadata field(s) {sorted(unknown)}; allowed fields are "
+                f"{sorted(COLUMN_METADATA_KEYS)}"
+            )
+
+        # Aucun champ fourni : rien à écrire
+        if not fields:
+            return
+
+        # Normalisation et validation de l'agrégation par défaut
+        if "default_aggregation" in fields:
+            fields["default_aggregation"] = normalize_default_aggregation(
+                fields["default_aggregation"]
+            )
+
+        # Vérification de l'existence d'une ligne pour la colonne visée
+        metadata_table = self._qualified("metadata")
+        exists = False
+        if self._table_exists("metadata"):
+            _row = self.conn.execute(
+                f"SELECT COUNT(*) FROM {metadata_table} WHERE name = ?", [column]
+            ).fetchone()
+            exists = _row is not None and _row[0] > 0
+        if not exists:
+            raise ValueError(
+                f"Column {column!r} has no row in the metadata table; "
+                "update_column_metadata only corrects existing columns"
+            )
+
+        # Construction de la clause SET (identifiants entre guillemets, valeurs liées)
+        set_clause = ", ".join(f"{quote_ident(name)} = ?" for name in fields)
+        params = [*fields.values(), column]
+        self.conn.execute(
+            f"UPDATE {metadata_table} SET {set_clause} WHERE name = ?", params
+        )
+
+        # Invalidation du cache
+        self._invalidate_metadata_cache()
+
+        # Logging
+        self.logger.info(
+            f"Updated metadata fields {sorted(fields)} for column {column}"
+        )
 
     # Méthode de mise à jour du statut catégoriel d'une donnée
     def _update_categorical_status(self, col_name: str, is_categorical: bool) -> None:

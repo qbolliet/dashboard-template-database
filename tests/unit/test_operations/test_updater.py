@@ -463,3 +463,45 @@ def test_update_stamps_dataset_metadata(
         "SELECT updated_at FROM dataset_metadata"
     ).fetchone()[0]
     assert after > before
+
+
+# ---------------------------------------------------------------------------
+# Tests de préservation des champs d'UI de la table metadata
+# ---------------------------------------------------------------------------
+
+
+# Test que update_database n'écrase jamais les champs d'UI renseignés par le producteur
+def test_update_database_preserves_ui_metadata(
+    updater: DatabaseUpdater, built_ducklake_schema: Any, update_df: pl.DataFrame
+) -> None:
+    """Test that a data update leaves the producer-owned UI metadata untouched.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+        built_ducklake_schema: DuckDB connection.
+        update_df: DataFrame with new rows to insert.
+    """
+    # Renseignement des champs d'UI avant la mise à jour
+    updater.update_column_metadata(
+        "value",
+        unit="€",
+        display_format=",.2f",
+        family="kpi",
+        description="the value",
+        default_aggregation="sum",
+    )
+
+    # Mise à jour de données (insertion de nouvelles lignes)
+    assert (
+        updater.update_database(
+            update_df=update_df, keep="first", use_transaction=False
+        )
+        is True
+    )
+
+    # Les champs d'UI sont inchangés après l'update
+    row = built_ducklake_schema.execute(
+        "SELECT unit, display_format, family, description, default_aggregation"
+        " FROM metadata WHERE name = 'value'"
+    ).fetchone()
+    assert row == ("€", ",.2f", "kpi", "the value", "SUM")

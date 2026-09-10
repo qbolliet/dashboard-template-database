@@ -1,6 +1,69 @@
 # Importation des modules
 import narwhals as nw
 
+# Champs d'UI de la table metadata renseignés par le producteur de métadonnées.
+# Tous VARCHAR nullable (NULL par défaut) ; un update de données ne les écrase jamais.
+UI_METADATA_FIELDS: tuple[str, ...] = (
+    "unit",
+    "display_format",
+    "family",
+    "description",
+    "default_aggregation",
+)
+
+# Clés acceptées dans un sous-dictionnaire de ``column_metadata`` : les champs d'UI
+# ci-dessus, plus le libellé d'affichage.
+COLUMN_METADATA_KEYS: frozenset[str] = frozenset({"label", *UI_METADATA_FIELDS})
+
+# Agrégations acceptées pour ``metadata.default_aggregation``, validées à l'écriture.
+ALLOWED_DEFAULT_AGGREGATIONS: frozenset[str] = frozenset(
+    {"SUM", "AVG", "MAX", "MIN", "COUNT", "MEDIAN", "MODE"}
+)
+
+
+# Fonction de normalisation et de validation de ``metadata.default_aggregation``
+def normalize_default_aggregation(value: str | None) -> str | None:
+    """
+    Normalize and validate a ``default_aggregation`` value.
+
+    ``None`` passes through unchanged (the field is nullable). A string is
+    upper-cased and checked against :data:`ALLOWED_DEFAULT_AGGREGATIONS`.
+
+    Args:
+        value (str | None): Raw aggregation label supplied by the metadata
+            producer.
+
+    Returns:
+        str | None: The upper-cased aggregation label, or ``None``.
+
+    Raises:
+        ValueError: If ``value`` is neither ``None`` nor one of the allowed
+            aggregations (case-insensitive).
+
+    Examples:
+        >>> normalize_default_aggregation('sum')
+        'SUM'
+        >>> normalize_default_aggregation(None) is None
+        True
+        >>> normalize_default_aggregation('total')  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid default_aggregation 'total'; ...
+    """
+    # Champ nullable : absence de valeur acceptée telle quelle
+    if value is None:
+        return None
+
+    # Normalisation en majuscules puis contrôle d'appartenance à la liste blanche
+    normalized = str(value).upper()
+    if normalized not in ALLOWED_DEFAULT_AGGREGATIONS:
+        raise ValueError(
+            f"Invalid default_aggregation {value!r}; expected one of "
+            f"{sorted(ALLOWED_DEFAULT_AGGREGATIONS)} or None"
+        )
+    return normalized
+
+
 # Hiérarchie des types SQL : (niveau, largeur en bits).
 # Le niveau ordonne les familles (booléen < entier < flottant < texte) ; la largeur
 # ordonne les types d'un même niveau, garantissant qu'un BIGINT enregistré n'est
