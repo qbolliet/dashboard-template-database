@@ -619,3 +619,129 @@ def test_add_column_to_metadata_preserves_ui_fields_on_update(
     ).fetchone()
     # Les champs d'UI ne sont pas remis à NULL
     assert row == ("€", ",.2f", "SUM")
+
+
+# ===========================================================================
+# Tests de update_column_metadata(parent_name=...) et de la hiérarchie (§2.5)
+# ===========================================================================
+
+
+# Test que update_column_metadata renseigne parent_name et force le statut catégoriel
+def test_update_column_metadata_parent_name_forces_categorical(
+    manager: DataManager,
+) -> None:
+    """Test that setting parent_name forces both ends of the link categorical.
+
+    'value' and 'date' are not categorical in the built schema fixture. Declaring
+    'value' as a child of 'date' must force both to categorical, with a warning.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    with pytest.warns(UserWarning, match="hierarchy"):
+        manager.update_column_metadata("value", parent_name="date")
+
+    row = manager.conn.execute(
+        "SELECT parent_name, is_categorical, is_categorical_forced"
+        " FROM metadata WHERE name = 'value'"
+    ).fetchone()
+    assert row == ("date", True, True)
+
+    parent_row = manager.conn.execute(
+        "SELECT is_categorical, is_categorical_forced"
+        " FROM metadata WHERE name = 'date'"
+    ).fetchone()
+    assert parent_row == (True, True)
+
+
+# Test que update_column_metadata refuse une colonne parente inexistante
+def test_update_column_metadata_parent_name_missing_parent_raises(
+    manager: DataManager,
+) -> None:
+    """Test that a parent_name referencing an unknown column raises ValueError.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    with pytest.raises(ValueError, match="no row in the metadata table"):
+        manager.update_column_metadata("value", parent_name="not_a_column")
+
+
+# Test que update_column_metadata refuse une auto-référence (cycle)
+def test_update_column_metadata_parent_name_self_reference_raises(
+    manager: DataManager,
+) -> None:
+    """Test that setting a column as its own parent raises a cycle ValueError.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    with pytest.raises(ValueError, match="Cycle detected"):
+        manager.update_column_metadata("value", parent_name="value")
+
+
+# Test que update_column_metadata refuse une modification créant un cycle
+def test_update_column_metadata_parent_name_cycle_raises(
+    manager: DataManager,
+) -> None:
+    """Test that a change creating a cycle against the current metadata state raises.
+
+    'category' is first declared as the parent of 'status'; then pointing
+    'category' back at 'status' would close a two-column cycle.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    manager.update_column_metadata("status", parent_name="category")
+    with pytest.raises(ValueError, match="Cycle detected"):
+        manager.update_column_metadata("category", parent_name="status")
+
+
+# Test que parent_name=None est accepté et efface la valeur sans validation
+def test_update_column_metadata_parent_name_clear(manager: DataManager) -> None:
+    """Test that clearing parent_name (None) works without hierarchy validation.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    with pytest.warns(UserWarning, match="hierarchy"):
+        manager.update_column_metadata("value", parent_name="date")
+
+    # Effacement : aucune validation de forêt ni forçage catégoriel à ce stade
+    manager.update_column_metadata("value", parent_name=None)
+
+    row = manager.conn.execute(
+        "SELECT parent_name FROM metadata WHERE name = 'value'"
+    ).fetchone()
+    assert row[0] is None
+
+
+# Test que _clear_child_parent_references détache les colonnes enfants
+def test_clear_child_parent_references_detaches_children(
+    manager: DataManager,
+) -> None:
+    """Test that _clear_child_parent_references NULLs out children's parent_name.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    with pytest.warns(UserWarning, match="hierarchy"):
+        manager.update_column_metadata("value", parent_name="date")
+    detached = manager._clear_child_parent_references("date")
+    assert detached == ["value"]
+
+    row = manager.conn.execute(
+        "SELECT parent_name FROM metadata WHERE name = 'value'"
+    ).fetchone()
+    assert row[0] is None
+
+
+# Test que _clear_child_parent_references ne fait rien pour une colonne sans enfant
+def test_clear_child_parent_references_no_children(manager: DataManager) -> None:
+    """Test that _clear_child_parent_references is a no-op absent any children.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    detached = manager._clear_child_parent_references("value")
+    assert detached == []

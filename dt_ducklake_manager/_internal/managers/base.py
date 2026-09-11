@@ -2,6 +2,7 @@
 # Modules de base
 import os
 import threading
+import warnings
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
@@ -13,6 +14,7 @@ import polars as pl
 from narwhals.typing import IntoDataFrame
 
 # Import des utilitaires
+from ...utils.hierarchy import validate_hierarchy_forest
 from ...utils.logger import _init_logger
 from ...utils.sql import qualify_table, quote_ident, resolve_catalog
 from ...utils.types import (
@@ -164,6 +166,7 @@ class BaseSchemaManager(ABC):
                                 "is_categorical": pl.Boolean,
                                 "is_categorical_forced": pl.Boolean,
                                 "is_primary_key": pl.Boolean,
+                                "parent_name": pl.String,
                                 "unit": pl.String,
                                 "display_format": pl.String,
                                 "family": pl.String,
@@ -371,6 +374,7 @@ class BaseSchemaManager(ABC):
                 is_categorical BOOLEAN,
                 is_categorical_forced BOOLEAN DEFAULT FALSE,
                 is_primary_key BOOLEAN DEFAULT FALSE,
+                parent_name VARCHAR,
                 unit VARCHAR,
                 display_format VARCHAR,
                 family VARCHAR,
@@ -433,28 +437,35 @@ class BaseSchemaManager(ABC):
         """
         Set or correct the producer-owned UI fields of an existing column.
 
-        Only ``label``, ``unit``, ``display_format``, ``family``, ``description`` and
-        ``default_aggregation`` may be updated. The update touches nothing else, so a
-        later data update never has to rebuild the base to fix a wrong unit or
-        format. ``default_aggregation`` is validated (and upper-cased) before the
-        write.
+        Only ``label``, ``parent_name``, ``unit``, ``display_format``, ``family``,
+        ``description`` and ``default_aggregation`` may be updated. The update
+        touches nothing else, so a later data update never has to rebuild the base
+        to fix a wrong unit or format. ``default_aggregation`` is validated (and
+        upper-cased) before the write. Setting ``parent_name`` declares (or
+        corrects) a column hierarchy link: the parent column must already
+        exist in metadata, the resulting graph must stay a forest (no cycle), and
+        both ``column`` and its new parent are forced categorical, with a warning,
+        if either is not already.
 
         Args:
             column: Name of the column, which must already have a row in the
                 metadata table.
-            **fields: Field/value pairs among ``label``, ``unit``,
+            **fields: Field/value pairs among ``label``, ``parent_name``, ``unit``,
                 ``display_format``, ``family``, ``description`` and
                 ``default_aggregation``. A value of ``None`` clears the field.
 
         Raises:
             ValueError: If a field name is not one of the allowed fields, if
-                ``default_aggregation`` is invalid, or if the column has no row in
-                the metadata table.
+                ``default_aggregation`` is invalid, if the column has no row in the
+                metadata table, if a non-``None`` ``parent_name`` references a
+                column absent from metadata, or if it would create a cycle in the
+                ``parent_name`` graph.
 
         Example:
             >>> manager.update_column_metadata(
             ...     'value', unit='€', display_format=',.2f',
             ...     default_aggregation='sum')
+            >>> manager.update_column_metadata('commune', parent_name='departement')
         """
         # Contrôle des champs autorisés
         unknown = set(fields) - COLUMN_METADATA_KEYS
@@ -488,12 +499,63 @@ class BaseSchemaManager(ABC):
                 "update_column_metadata only corrects existing columns"
             )
 
+        # Validation spécifique à parent_name : existence de la colonne parente dans
+        # l'état courant de metadata, puis détection de cycle sur le graphe complet.
+        # Extraction du nouveau parent
+        new_parent = fields.get("parent_name")
+        if "parent_name" in fields and new_parent is not None:
+            # Vérification que la colonne parent existe dans la table des métadonnées (et est donc une colonne valide de la table des faits)
+            _prow = self.conn.execute(
+                f"SELECT COUNT(*) FROM {metadata_table} WHERE name = ?", [new_parent]
+            ).fetchone()
+            # Cas d'erreur si la colonne n'est pas trouvée
+            if _prow is None or _prow[0] == 0:
+                raise ValueError(
+                    f"Parent column {new_parent!r} has no row in the metadata table"
+                )
+            # Extraction des paires parent/enfant
+            current_rows = self.conn.execute(
+                f"SELECT name, parent_name FROM {metadata_table}"
+            ).fetchall()
+            parent_of = {name: parent for name, parent in current_rows}
+            parent_of[column] = new_parent
+            # Validation de la hiérarchie
+            validate_hierarchy_forest(parent_of)
+
         # Construction de la clause SET (identifiants entre guillemets, valeurs liées)
         set_clause = ", ".join(f"{quote_ident(name)} = ?" for name in fields)
         params = [*fields.values(), column]
         self.conn.execute(
             f"UPDATE {metadata_table} SET {set_clause} WHERE name = ?", params
         )
+
+        # Forçage catégoriel des deux extrémités d'un lien de hiérarchie nouvellement
+        # déclaré.
+        if "parent_name" in fields and new_parent is not None:
+            for hierarchy_col in (column, new_parent):
+                _crow = self.conn.execute(
+                    f"SELECT is_categorical FROM {metadata_table} WHERE name = ?",
+                    [hierarchy_col],
+                ).fetchone()
+                if _crow is not None and not _crow[0]:
+                    # Forçage du statut catégoriel
+                    self.conn.execute(
+                        f"UPDATE {metadata_table} SET is_categorical = TRUE, "
+                        "is_categorical_forced = TRUE WHERE name = ?",
+                        [hierarchy_col],
+                    )
+                    # Warning
+                    warnings.warn(
+                        f"Column {hierarchy_col!r} is part of a column hierarchy but"
+                        f" is not categorical; forcing is_categorical=True",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    # Logging
+                    self.logger.info(
+                        f"Forced is_categorical=True for hierarchy column"
+                        f" {hierarchy_col!r}"
+                    )
 
         # Invalidation du cache
         self._invalidate_metadata_cache()
@@ -551,6 +613,52 @@ class BaseSchemaManager(ABC):
                 f"Failed to delete metadata for column {column_name}: {e}"
             )
             raise
+
+    # Méthode de détachement des colonnes enfants d'une colonne parente supprimée
+    def _clear_child_parent_references(self, column: str) -> list[str]:
+        """
+        Clear ``parent_name`` on every column whose hierarchy parent is ``column``.
+
+        Used when a column that is the parent of another column (§2.5) is deleted
+        with ``cascade=True``: rather than leaving children pointing at a column
+        that no longer exists, their ``parent_name`` is reset to ``NULL`` and a
+        warning is logged.
+
+        Args:
+            column: Name of the column about to be dropped, used as the parent
+                reference to detach.
+
+        Returns:
+            list[str]: Names of the child columns that were detached. Empty when
+            ``column`` was not a hierarchy parent.
+
+        Example:
+            >>> manager._clear_child_parent_references('region')
+            ['departement']
+        """
+        # Table des méta-données
+        metadata_table = self._qualified("metadata")
+        # Extraction des enfants associés à la colonne
+        children = [
+            row[0]
+            for row in self.conn.execute(
+                f"SELECT name FROM {metadata_table} WHERE parent_name = ?", [column]
+            ).fetchall()
+        ]
+        # Retrait du parent
+        if children:
+            self.conn.execute(
+                f"UPDATE {metadata_table} SET parent_name = NULL WHERE parent_name = ?",
+                [column],
+            )
+            # Invalidation du cache
+            self._invalidate_metadata_cache()
+            # Logging
+            self.logger.warning(
+                f"Column {column!r} was the parent of {children}; their"
+                f" parent_name was cleared to NULL (cascade=True)"
+            )
+        return children
 
     # Méthodes de résolution des conflits de types
     def _resolve_type_conflicts(

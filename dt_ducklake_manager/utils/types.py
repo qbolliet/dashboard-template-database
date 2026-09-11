@@ -3,7 +3,10 @@ import narwhals as nw
 
 # Champs d'UI de la table metadata renseignés par le producteur de métadonnées.
 # Tous VARCHAR nullable (NULL par défaut) ; un update de données ne les écrase jamais.
+# parent_name porte la hiérarchie de colonnes : la colonne
+# parente dans un menu à group-options / arbre de sélection.
 UI_METADATA_FIELDS: tuple[str, ...] = (
+    "parent_name",
     "unit",
     "display_format",
     "family",

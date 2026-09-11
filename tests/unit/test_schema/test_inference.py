@@ -4,6 +4,7 @@ import warnings
 from typing import Any
 
 import narwhals as nw
+import polars as pl
 
 # Module de tests
 import pytest
@@ -580,3 +581,250 @@ def test_column_metadata_invalid_default_aggregation_raises(
         schema_builder.create_metadata_table(
             column_metadata={"value": {"default_aggregation": "TOTAL"}}
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests des hiérarchies de colonnes (parent_name, §2.5)
+# ---------------------------------------------------------------------------
+
+
+# Test que le paramètre hierarchies renseigne parent_name
+def test_hierarchies_param_sets_parent_name(sample_df: Any) -> None:
+    """Test that the ``hierarchies`` constructor parameter writes ``parent_name``.
+
+    ``category`` and ``status`` are both already categorical under
+    categorical_threshold=4, so no forcing warning is expected here.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    builder = SchemaBuilder(
+        sample_df,
+        categorical_threshold=4,
+        primary_keys=["id"],
+        hierarchies={"category": "status"},
+    )
+    metadata = builder.create_metadata_table()
+
+    row = metadata.filter(nw.col("name") == "category")
+    assert row["parent_name"][0] == "status"
+
+
+# Test que parent_name peut être renseigné via column_metadata uniquement
+def test_parent_name_via_column_metadata_only(schema_builder: Any) -> None:
+    """Test that ``column_metadata``'s ``parent_name`` key alone sets the hierarchy.
+
+    Args:
+        schema_builder: SchemaBuilder fixture (categorical_threshold=4).
+    """
+    metadata = schema_builder.create_metadata_table(
+        column_metadata={"category": {"parent_name": "status"}}
+    )
+    row = metadata.filter(nw.col("name") == "category")
+    assert row["parent_name"][0] == "status"
+
+
+# Test qu'une colonne non catégorielle appartenant à une hiérarchie est forcée
+def test_hierarchies_forces_non_categorical_column(sample_df: Any) -> None:
+    """Test that a non-categorical hierarchy column is forced categorical with a
+    warning.
+
+    'high_cardinality' has 5 distinct values, above categorical_threshold=4, so it
+    is NOT categorical by default. Declaring it as a child of 'status' in a
+    hierarchy must force is_categorical=True and is_categorical_forced=True, with a
+    UserWarning, exactly as categorical_overrides would.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    builder = SchemaBuilder(
+        sample_df,
+        categorical_threshold=4,
+        primary_keys=["id"],
+        hierarchies={"high_cardinality": "status"},
+    )
+    with pytest.warns(UserWarning, match="high_cardinality.*hierarchy"):
+        metadata = builder.create_metadata_table()
+
+    row = metadata.filter(nw.col("name") == "high_cardinality")
+    assert row["is_categorical"][0] is True
+    assert row["is_categorical_forced"][0] is True
+    assert row["parent_name"][0] == "status"
+
+
+# Test qu'une colonne enfant inconnue dans hierarchies lève une ValueError à
+# l'initialisation
+def test_hierarchies_unknown_child_raises(sample_df: Any) -> None:
+    """Test that an unknown child column in ``hierarchies`` raises ValueError.
+
+    Args:
+        sample_df: polars DataFrame fixture from conftest.
+    """
+    with pytest.raises(ValueError, match="do not exist in the DataFrame"):
+        SchemaBuilder(
+            sample_df,
+            categorical_threshold=4,
+            primary_keys=["id"],
+            hierarchies={"not_a_column": "status"},
+        )
+
+
+# Test qu'une colonne parente inconnue dans hierarchies lève une ValueError à
+# l'initialisation
+def test_hierarchies_unknown_parent_raises(sample_df: Any) -> None:
+    """Test that an unknown parent column in ``hierarchies`` raises ValueError.
+
+    Args:
+        sample_df: polars DataFrame fixture from conftest.
+    """
+    with pytest.raises(ValueError, match="do not exist in the DataFrame"):
+        SchemaBuilder(
+            sample_df,
+            categorical_threshold=4,
+            primary_keys=["id"],
+            hierarchies={"category": "not_a_column"},
+        )
+
+
+# Test qu'une colonne parente inconnue fournie via column_metadata lève une ValueError
+def test_parent_name_unknown_parent_via_column_metadata_raises(
+    schema_builder: Any,
+) -> None:
+    """Test that an unknown ``parent_name`` in ``column_metadata`` raises ValueError.
+
+    Args:
+        schema_builder: SchemaBuilder fixture (categorical_threshold=4).
+    """
+    with pytest.raises(ValueError, match="do not exist in the DataFrame"):
+        schema_builder.create_metadata_table(
+            column_metadata={"category": {"parent_name": "not_a_column"}}
+        )
+
+
+# Test qu'une auto-référence (A -> A) est détectée comme un cycle
+def test_hierarchies_self_reference_raises(sample_df: Any) -> None:
+    """Test that a column declared as its own parent raises a cycle ValueError.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    builder = SchemaBuilder(
+        sample_df,
+        categorical_threshold=4,
+        primary_keys=["id"],
+        hierarchies={"category": "category"},
+    )
+    with pytest.raises(ValueError, match="Cycle detected"):
+        builder.create_metadata_table()
+
+
+# Test qu'un cycle à deux colonnes (A -> B -> A) est détecté
+def test_hierarchies_two_node_cycle_raises(sample_df: Any) -> None:
+    """Test that a two-column cycle (A -> B -> A) raises a cycle ValueError.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    builder = SchemaBuilder(
+        sample_df,
+        categorical_threshold=4,
+        primary_keys=["id"],
+        hierarchies={"category": "status", "status": "category"},
+    )
+    with pytest.raises(ValueError, match="Cycle detected"):
+        builder.create_metadata_table()
+
+
+# Test que hierarchies et column_metadata contradictoires lèvent une ValueError
+def test_hierarchies_and_column_metadata_conflict_raises(sample_df: Any) -> None:
+    """Test that conflicting ``hierarchies`` and ``column_metadata`` raise ValueError.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    builder = SchemaBuilder(
+        sample_df,
+        categorical_threshold=4,
+        primary_keys=["id"],
+        hierarchies={"category": "status"},
+    )
+    with pytest.raises(ValueError, match="Conflicting parent_name"):
+        builder.create_metadata_table(
+            column_metadata={"category": {"parent_name": "high_cardinality"}}
+        )
+
+
+# Test que hierarchies et column_metadata cohérents ne lèvent aucune erreur
+def test_hierarchies_and_column_metadata_agree_ok(sample_df: Any) -> None:
+    """Test that ``hierarchies`` and ``column_metadata`` agreeing on the same parent
+    does not raise.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    builder = SchemaBuilder(
+        sample_df,
+        categorical_threshold=4,
+        primary_keys=["id"],
+        hierarchies={"category": "status"},
+    )
+    metadata = builder.create_metadata_table(
+        column_metadata={"category": {"parent_name": "status"}}
+    )
+    row = metadata.filter(nw.col("name") == "category")
+    assert row["parent_name"][0] == "status"
+
+
+# Test d'une hiérarchie profonde (5 niveaux)
+def test_hierarchies_deep_chain() -> None:
+    """Test that a 5-level column hierarchy is fully declared without error."""
+    df = pl.DataFrame(
+        {
+            "id": [1, 2],
+            "l0": ["a", "b"],
+            "l1": ["a1", "b1"],
+            "l2": ["a2", "b2"],
+            "l3": ["a3", "b3"],
+            "l4": ["a4", "b4"],
+        }
+    )
+    builder = SchemaBuilder(
+        df,
+        categorical_threshold=10,
+        primary_keys=["id"],
+        hierarchies={"l4": "l3", "l3": "l2", "l2": "l1", "l1": "l0"},
+    )
+    metadata = builder.create_metadata_table()
+
+    expected_parent = {"l4": "l3", "l3": "l2", "l2": "l1", "l1": "l0", "l0": None}
+    for col, parent in expected_parent.items():
+        row = metadata.filter(nw.col("name") == col)
+        assert row["parent_name"][0] == parent
+        # Toutes les colonnes de la chaîne doivent être catégorielles
+        assert row["is_categorical"][0] is True
+
+
+# Test de deux hiérarchies indépendantes déclarées simultanément
+def test_hierarchies_two_independent_trees() -> None:
+    """Test that two unrelated column hierarchies can be declared together."""
+    df = pl.DataFrame(
+        {
+            "id": [1, 2],
+            "region": ["r1", "r2"],
+            "departement": ["d1", "d2"],
+            "category": ["c1", "c2"],
+            "subcategory": ["s1", "s2"],
+        }
+    )
+    builder = SchemaBuilder(
+        df,
+        categorical_threshold=10,
+        primary_keys=["id"],
+        hierarchies={"departement": "region", "subcategory": "category"},
+    )
+    metadata = builder.create_metadata_table()
+
+    dep_row = metadata.filter(nw.col("name") == "departement")
+    assert dep_row["parent_name"][0] == "region"
+    subcat_row = metadata.filter(nw.col("name") == "subcategory")
+    assert subcat_row["parent_name"][0] == "category"

@@ -79,6 +79,7 @@ class DuckLakeTablesBuilder:
         categorical_threshold: int | None = None,
         primary_keys: list[str] | None = None,
         categorical_overrides: dict[str, bool] | None = None,
+        hierarchies: dict[str, str] | None = None,
         connection: duckdb.DuckDBPyConnection | None = None,
         schema: str = "main",
         catalog_alias: str = "db",
@@ -101,6 +102,11 @@ class DuckLakeTablesBuilder:
             categorical_overrides (Optional[Dict[str, bool]]): Per-column forcing of
                 the categorical status, independent of the threshold. A forced column
                 is never re-evaluated by a later update. Defaults to None.
+            hierarchies (Optional[Dict[str, str]]): Column hierarchy declared as a
+                mapping of child column name to parent column name, written to
+                ``metadata.parent_name``. Must agree with
+                any ``parent_name`` also supplied through ``column_metadata``.
+                Defaults to None.
             connection (Optional[duckdb.DuckDBPyConnection]): DuckLake-attached DuckDB
                 connection obtained from ``DuckLakeConnector.connect()``. If None, an
                 in-memory DuckDB connection is used (for unit tests only).
@@ -134,6 +140,7 @@ class DuckLakeTablesBuilder:
             categorical_threshold=categorical_threshold,
             primary_keys=primary_keys,
             categorical_overrides=categorical_overrides,
+            hierarchies=hierarchies,
             log_filename=log_filename,
         )
 
@@ -199,8 +206,8 @@ class DuckLakeTablesBuilder:
             column_labels (Optional[Dict[str, str]]): Optional mapping of column names
                 to labels.
             column_metadata (Optional[Dict[str, Dict[str, str]]]): Optional per-column
-                UI metadata (``label``, ``unit``, ``display_format``, ``family``,
-                ``description``, ``default_aggregation``). Forwarded to
+                UI metadata (``label``, ``parent_name``, ``unit``, ``display_format``,
+                ``family``, ``description``, ``default_aggregation``). Forwarded to
                 ``SchemaBuilder.create_metadata_table``; ``column_metadata`` wins over
                 ``column_labels`` when both carry a label for the same column.
 
@@ -238,6 +245,7 @@ class DuckLakeTablesBuilder:
                 is_categorical BOOLEAN,
                 is_categorical_forced BOOLEAN,
                 is_primary_key BOOLEAN,
+                parent_name VARCHAR,
                 unit VARCHAR,
                 display_format VARCHAR,
                 family VARCHAR,
@@ -252,11 +260,11 @@ class DuckLakeTablesBuilder:
         self.conn.execute(f"""
             INSERT INTO {qualified_name}
                 (name, label, sql_type, is_categorical, is_categorical_forced,
-                 is_primary_key, unit, display_format, family, description,
-                 default_aggregation)
+                 is_primary_key, parent_name, unit, display_format, family,
+                 description, default_aggregation)
             SELECT name, label, sql_type, is_categorical, is_categorical_forced,
-                   is_primary_key, unit, display_format, family, description,
-                   default_aggregation
+                   is_primary_key, parent_name, unit, display_format, family,
+                   description, default_aggregation
             FROM temp_metadata
         """)
         self.conn.execute("DROP VIEW temp_metadata")
@@ -463,9 +471,9 @@ class DuckLakeTablesBuilder:
             column_labels (Optional[Dict[str, str]]): Optional mapping of column names
                 to labels.
             column_metadata (Optional[Dict[str, Dict[str, str]]]): Optional per-column
-                UI metadata (``label``, ``unit``, ``display_format``, ``family``,
-                ``description``, ``default_aggregation``), written into the metadata
-                table. Defaults to None.
+                UI metadata (``label``, ``parent_name``, ``unit``, ``display_format``,
+                ``family``, ``description``, ``default_aggregation``), written into
+                the metadata table. Defaults to None.
             check_duplicates (bool): Whether to check and remove duplicates. Defaults to
                 True.
             keep (Literal['any', 'none', 'first', 'last']): Which duplicates to keep.

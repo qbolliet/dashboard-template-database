@@ -1,4 +1,5 @@
 # Importation des éléments d'intérêt du module
+from .hierarchy import get_column_hierarchies, validate_hierarchy_forest
 from .logger import _init_logger
 from .sql import (
     build_database_duplicate_removal_query,
@@ -30,4 +31,6 @@ __all__ = [
     "UI_METADATA_FIELDS",
     "COLUMN_METADATA_KEYS",
     "ALLOWED_DEFAULT_AGGREGATIONS",
+    "get_column_hierarchies",
+    "validate_hierarchy_forest",
 ]

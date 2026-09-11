@@ -8,6 +8,7 @@ import narwhals as nw
 from narwhals.typing import IntoDataFrame
 
 # Module d'initialisation du logger
+from ..utils.hierarchy import validate_hierarchy_forest
 from ..utils.logger import _init_logger
 
 # Utilitaires de traitement des données
@@ -29,9 +30,10 @@ def _validate_column_metadata(
 
     Args:
         column_metadata: Mapping of column name to a sub-dictionary of UI fields
-            (``label``, ``unit``, ``display_format``, ``family``, ``description``,
-            ``default_aggregation``), all keys optional. ``None`` yields an empty
-            mapping.
+            (``label``, ``parent_name``, ``unit``, ``display_format``, ``family``,
+            ``description``, ``default_aggregation``), all keys optional. ``None``
+            yields an empty mapping. Note that ``parent_name`` existence and
+            forest validation happen later, in ``SchemaBuilder._resolve_hierarchies``.
         columns: Column names available in the source DataFrame.
 
     Returns:
@@ -108,6 +110,7 @@ class SchemaBuilder:
         categorical_threshold: int | None = None,
         primary_keys: list[str] | None = None,
         categorical_overrides: dict[str, bool] | None = None,
+        hierarchies: dict[str, str] | None = None,
         log_filename: str | os.PathLike[str] | None = None,
     ) -> None:
         """
@@ -130,12 +133,18 @@ class SchemaBuilder:
                 the categorical status, independent of the threshold. A forced column
                 is marked ``is_categorical_forced`` in the metadata table and is never
                 re-evaluated by a subsequent update. Defaults to None.
+            hierarchies (Optional[Dict[str, str]]): Column hierarchy declared as a
+                mapping of child column name to parent column name (e.g.
+                ``{'commune': 'departement', 'departement': 'region'}``). Written to
+                ``metadata.parent_name``. Must agree with any ``parent_name`` also
+                supplied through ``column_metadata``. Defaults to None.
             log_filename (os.PathLike, optional): Path to the log file. Defaults to
                 a file named `schema_builder.log` in a logs directory.
 
         Raises:
-            ValueError: If a primary key or a ``categorical_overrides`` key does not
-                exist in the DataFrame.
+            ValueError: If a primary key, a ``categorical_overrides`` key, a
+                ``hierarchies`` key or a ``hierarchies`` value does not exist in the
+                DataFrame.
 
         Examples:
             >>> # Single primary key (with polars)
@@ -157,6 +166,11 @@ class SchemaBuilder:
             >>> # A column forced as categorical whatever its cardinality
             >>> builder = SchemaBuilder(df, categorical_threshold=50,
             ...     primary_keys=['id'], categorical_overrides={'city': True})
+
+            >>> # A column hierarchy: commune -> departement -> region
+            >>> builder = SchemaBuilder(df, categorical_threshold=50,
+            ...     primary_keys=['id'],
+            ...     hierarchies={'commune': 'departement', 'departement': 'region'})
         """
         # Conversion vers narwhals
         self.df = nw.from_native(df, eager_only=True)
@@ -174,6 +188,29 @@ class SchemaBuilder:
                     f" DataFrame: {sorted(unknown_cols)}"
                 )
         self.categorical_overrides = categorical_overrides or {}
+
+        # Validation de la hiérarchie de colonnes si spécifiée : les colonnes
+        # enfants et parentes doivent toutes exister dans le DataFrame. La
+        # cohérence avec un éventuel parent_name fourni via column_metadata et la
+        # détection de cycle sont vérifiées plus tard, dans create_metadata_table,
+        # où les deux sources sont fusionnées.
+        if hierarchies:
+            # Vérification que l'ensemble des enfants est dans le jeu de données
+            unknown_children = set(hierarchies) - set(self.df.columns)
+            if unknown_children:
+                raise ValueError(
+                    f"The following hierarchies columns do not exist in the"
+                    f" DataFrame: {sorted(unknown_children)}"
+                )
+            # Vérification que l'ensemble des parents est dans le jeu de données
+            unknown_parents = set(hierarchies.values()) - set(self.df.columns)
+            if unknown_parents:
+                raise ValueError(
+                    f"The following hierarchies parent columns do not exist in the"
+                    f" DataFrame: {sorted(unknown_parents)}"
+                )
+        # Instanciation des hiérarchies
+        self.hierarchies = dict(hierarchies) if hierarchies else {}
 
         # Validation des clés primaires si spécifiées
         if primary_keys is not None and len(primary_keys) > 0:
@@ -212,6 +249,81 @@ class SchemaBuilder:
                 f"Primary keys validated successfully: {self.primary_keys}"
             )
 
+    # Méthode de résolution et de validation de la hiérarchie de colonnes
+    def _resolve_hierarchies(
+        self, column_metadata_norm: dict[str, dict[str, str | None]]
+    ) -> set[str]:
+        """
+        Merge, validate and inject the column hierarchy into ``column_metadata_norm``.
+
+        Combines ``self.hierarchies`` (the dedicated constructor parameter) with any
+        ``parent_name`` supplied per column through ``column_metadata``, checks both
+        sources agree where they overlap, validates that every parent column exists
+        in the DataFrame and that the resulting graph is a forest (no cycle), then
+        writes the resolved ``parent_name`` back into ``column_metadata_norm`` so it
+        is picked up like any other UI field.
+
+        Args:
+            column_metadata_norm (dict[str, dict[str, str | None]]): Normalized
+                ``column_metadata`` mapping, mutated in place with the resolved
+                ``parent_name`` for every column that has one.
+
+        Returns:
+            set[str]: Every column participating in a hierarchy (as a child, a
+            parent, or both), which must end up categorical.
+
+        Raises:
+            ValueError: If ``self.hierarchies`` and ``column_metadata`` disagree on a
+                column's parent, if a parent column does not exist in the DataFrame,
+                or if the merged graph contains a cycle.
+        """
+        # Extraction du parent_name éventuellement déclaré via column_metadata.
+        # L'affectation via l'opérateur walrus permet à mypy de rétrécir le type
+        # de "parent" à str (fields.get retourne str | None).
+        from_column_metadata: dict[str, str] = {
+            col: parent
+            for col, fields in column_metadata_norm.items()
+            if (parent := fields.get("parent_name")) is not None
+        }
+
+        # Fusion des deux sources avec contrôle de cohérence
+        parent_of: dict[str, str] = {}
+        for col, parent in self.hierarchies.items():
+            parent_of[col] = parent
+        for col, parent in from_column_metadata.items():
+            if col in parent_of and parent_of[col] != parent:
+                raise ValueError(
+                    f"Conflicting parent_name for column {col!r}: hierarchies says"
+                    f" {parent_of[col]!r}, column_metadata says {parent!r}"
+                )
+            parent_of[col] = parent
+
+        # Rien à valider en l'absence de toute hiérarchie déclarée
+        if not parent_of:
+            return set()
+
+        # Vérification de l'existence des colonnes parentes (celles issues de
+        # column_metadata n'ont pas encore été validées ; celles de hierarchies l'ont
+        # été à l'initialisation).
+        unknown_parents = set(parent_of.values()) - set(self.df.columns)
+        if unknown_parents:
+            raise ValueError(
+                f"The following parent_name columns do not exist in the DataFrame:"
+                f" {sorted(unknown_parents)}"
+            )
+
+        # Détection de cycle : le graphe des parent_name doit être une forêt
+        validate_hierarchy_forest(parent_of)
+
+        # Injection du parent_name résolu dans column_metadata_norm : lu ensuite
+        # comme n'importe quel autre champ d'UI par la boucle de create_metadata_table
+        for col, parent in parent_of.items():
+            column_metadata_norm.setdefault(col, {})["parent_name"] = parent
+
+        # Colonnes participant à la hiérarchie (enfants et parents), qui doivent
+        # toutes être catégorielles
+        return set(parent_of.keys()) | set(parent_of.values())
+
     # Méthode inférant le type des colonnes du jeu de données
     def create_metadata_table(
         self,
@@ -229,16 +341,21 @@ class SchemaBuilder:
 
         The UI fields ``unit``, ``display_format``, ``family``, ``description`` and
         ``default_aggregation`` are all VARCHAR, nullable, and default to ``None``.
-        They are supplied per column through ``column_metadata``.
+        They are supplied per column through ``column_metadata``. ``parent_name``
+        (also VARCHAR, nullable) declares a column hierarchy: it can be
+        supplied here, through the constructor's ``hierarchies`` parameter, or both
+        (in which case they must agree). Any column participating in a hierarchy is
+        forced categorical, with a warning, if it is not already.
 
         Args:
             column_labels (dict, optional): A dictionary mapping column names to labels.
                                             Defaults to None.
             column_metadata (dict, optional): Mapping of column name to a
                 sub-dictionary with optional keys ``label``, ``unit``,
-                ``display_format`` (a d3-format string), ``family``, ``description``
-                and ``default_aggregation`` (one of ``SUM``, ``AVG``, ``MIN``,
-                ``MAX``, ``COUNT``, ``MEDIAN``, ``MODE``, validated on write). When a
+                ``display_format`` (a d3-format string), ``family``, ``description``,
+                ``default_aggregation`` (one of ``SUM``, ``AVG``, ``MIN``,
+                ``MAX``, ``COUNT``, ``MEDIAN``, ``MODE``, validated on write) and
+                ``parent_name`` (the parent column of a column hierarchy). When a
                 label is given both here and in ``column_labels``, this mapping wins.
                 Defaults to None.
 
@@ -248,8 +365,10 @@ class SchemaBuilder:
 
         Raises:
             ValueError: If ``column_metadata`` references a column absent from the
-                DataFrame, carries an unknown sub-dictionary key, or supplies an
-                invalid ``default_aggregation``.
+                DataFrame, carries an unknown sub-dictionary key, supplies an
+                invalid ``default_aggregation``, disagrees with ``hierarchies`` on a
+                column's parent, references a ``parent_name`` column absent from the
+                DataFrame, or if the resulting ``parent_name`` graph contains a cycle.
 
         Examples:
             >>> metadata = builder.create_metadata_table()
@@ -262,6 +381,13 @@ class SchemaBuilder:
         column_metadata_norm = _validate_column_metadata(
             column_metadata, list(self.df.columns)
         )
+
+        # Fusion des deux sources de hiérarchie (paramètre dédié hierarchies et clé
+        # parent_name de column_metadata), avec contrôle de cohérence, validation de
+        # l'existence des colonnes parentes et détection de cycle (forêt). Le
+        # parent_name résolu est injecté dans column_metadata_norm, d'où le champ
+        # sera lu comme n'importe quel autre champ d'UI par la boucle ci-dessous.
+        hierarchy_columns = self._resolve_hierarchies(column_metadata_norm)
 
         # Initialisation de la liste des méta-données
         list_metadata = []
@@ -336,6 +462,26 @@ class SchemaBuilder:
                 self.logger.info(
                     f"The categorical status of column '{col}' is forced to"
                     f" {metadata['is_categorical']} by categorical_overrides"
+                )
+
+            # Forçage catégoriel des colonnes appartenant à une hiérarchie :
+            # invariant non négociable, il l'emporte donc sur un categorical_overrides
+            # explicite à False pour la même colonne.
+            if col in hierarchy_columns and not metadata["is_categorical"]:
+                # Forçage du statut catégoriel
+                metadata["is_categorical"] = True
+                metadata["is_categorical_forced"] = True
+                # Warning indiquant la conversion
+                warnings.warn(
+                    f"Column {col!r} is part of a column hierarchy but is not"
+                    f" categorical; forcing is_categorical=True",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                # Logging
+                self.logger.info(
+                    f"Column '{col}' is part of a column hierarchy: forcing"
+                    f" is_categorical=True"
                 )
 
             # Ajout au dictionnaire

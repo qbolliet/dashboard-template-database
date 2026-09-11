@@ -489,6 +489,7 @@ class DatabaseAuditor:
                 "is_categorical",
                 "is_categorical_forced",
                 "is_primary_key",
+                "parent_name",
                 "unit",
                 "display_format",
                 "family",

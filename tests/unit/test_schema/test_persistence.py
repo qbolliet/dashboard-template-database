@@ -719,3 +719,71 @@ def test_build_schema_invalid_default_aggregation_raises(
         builder.build_schema(
             column_metadata={"value": {"default_aggregation": "SOMME"}}
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests de la hiérarchie de colonnes (parent_name, §2.5)
+# ---------------------------------------------------------------------------
+
+
+# Test que le DDL de metadata porte la colonne parent_name, VARCHAR nullable
+def test_metadata_ddl_carries_parent_name(
+    ducklake_builder: DuckLakeTablesBuilder,
+) -> None:
+    """Test that the metadata table DDL includes the nullable parent_name column.
+
+    Args:
+        ducklake_builder: DuckLakeTablesBuilder fixture.
+    """
+    ducklake_builder.create_duckdb_metadata_table(table_name="test_metadata")
+
+    described = ducklake_builder.conn.execute("DESCRIBE test_metadata").fetchall()
+    columns = {row[0]: (row[1], row[2]) for row in described}
+
+    assert "parent_name" in columns
+    assert columns["parent_name"][0] == "VARCHAR"
+    assert columns["parent_name"][1] == "YES"
+
+
+# Test que build_schema écrit la hiérarchie déclarée via le paramètre hierarchies
+def test_build_schema_writes_hierarchies(sample_df: pl.DataFrame) -> None:
+    """Test that hierarchies passed to the constructor reach the metadata table.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        builder = DuckLakeTablesBuilder(
+            sample_df,
+            categorical_threshold=4,
+            primary_keys=["id"],
+            hierarchies={"category": "status"},
+        )
+
+    builder.build_schema()
+
+    row = builder.conn.execute(
+        "SELECT parent_name FROM metadata WHERE name = 'category'"
+    ).fetchone()
+    assert row[0] == "status"
+
+
+# Test que build_schema propage une erreur de cycle dans la hiérarchie
+def test_build_schema_hierarchy_cycle_raises(sample_df: pl.DataFrame) -> None:
+    """Test that a cyclic hierarchy aborts build_schema with ValueError.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        builder = DuckLakeTablesBuilder(
+            sample_df,
+            categorical_threshold=4,
+            primary_keys=["id"],
+            hierarchies={"category": "status", "status": "category"},
+        )
+
+    with pytest.raises(ValueError, match="Cycle detected"):
+        builder.build_schema()

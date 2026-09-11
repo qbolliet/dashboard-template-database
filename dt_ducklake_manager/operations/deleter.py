@@ -429,14 +429,23 @@ class DatabaseDeleter(BaseSchemaManager):
         columns: list[str],
         use_transaction: bool = True,
         validate_dependencies: bool = True,
+        cascade: bool = False,
     ) -> dict[str, bool]:
         """
         Delete columns from fact table and related structures with dependency analysis.
+
+        A column that is the parent of another column in a hierarchy cannot
+        be deleted by default: it would silently orphan its children's
+        ``parent_name``. Pass ``cascade=True`` to allow it anyway; every child's
+        ``parent_name`` is then reset to ``NULL``, with a warning.
 
         Args:
             columns: List of column names to delete
             use_transaction: Whether to use database transactions
             validate_dependencies: Whether to validate column dependencies
+            cascade: Whether to allow deleting a column that is the parent of
+                another column, detaching its children (``parent_name`` set to
+                ``NULL``) instead of refusing the deletion. Defaults to False.
 
         Returns:
             Dictionary mapping column names to success status
@@ -445,6 +454,8 @@ class DatabaseDeleter(BaseSchemaManager):
             >>> results = deleter.delete_columns(['old_col1', 'old_col2'])
             >>> for col, success in results.items():
             ...     print(f"Column {col}: {'deleted' if success else 'failed'}")
+            >>> # Deleting a hierarchy parent, detaching its children
+            >>> results = deleter.delete_columns(['region'], cascade=True)
         """
         # Validation préalable
         if not self.validate_operation("drop_column", columns=columns):
@@ -454,7 +465,9 @@ class DatabaseDeleter(BaseSchemaManager):
 
         # Analyse des dépendances si activée
         if validate_dependencies:
-            dependency_report = self._analyze_column_dependencies(columns)
+            dependency_report = self._analyze_column_dependencies(
+                columns, cascade=cascade
+            )
             if dependency_report["has_critical_dependencies"]:
                 # Logging
                 self.logger.error(
@@ -468,10 +481,10 @@ class DatabaseDeleter(BaseSchemaManager):
         # Suppression des colonnes
         if use_transaction:
             # Avec transaction
-            results = self._delete_columns_transactional(columns)
+            results = self._delete_columns_transactional(columns, cascade=cascade)
         else:
             # Directement
-            results = self._delete_columns_direct(columns)
+            results = self._delete_columns_direct(columns, cascade=cascade)
 
         # Horodatage dès qu'au moins une colonne a effectivement été supprimée
         if any(results.values()):
@@ -480,7 +493,9 @@ class DatabaseDeleter(BaseSchemaManager):
         return results
 
     # Méthode de suppression de colonnes de manière transactionnelle
-    def _delete_columns_transactional(self, columns: list[str]) -> dict[str, bool]:
+    def _delete_columns_transactional(
+        self, columns: list[str], cascade: bool = False
+    ) -> dict[str, bool]:
         """Transactional column deletion with rollback support."""
 
         # Début de la transaction
@@ -507,6 +522,11 @@ class DatabaseDeleter(BaseSchemaManager):
             # Traitement de chaque colonne
             for column in valid_columns:
                 try:
+                    # Détachement des colonnes enfants d'une hiérarchie avant
+                    # suppression (cascade=True uniquement)
+                    if cascade:
+                        self._clear_child_parent_references(column)
+
                     # Étape 1: Suppression de la colonne de la fact table
                     operation = TransactionOperation(
                         operation_type="drop_column",
@@ -588,7 +608,9 @@ class DatabaseDeleter(BaseSchemaManager):
             return {col: False for col in columns}
 
     # Suppression des colonnes sans transaction
-    def _delete_columns_direct(self, columns: list[str]) -> dict[str, bool]:
+    def _delete_columns_direct(
+        self, columns: list[str], cascade: bool = False
+    ) -> dict[str, bool]:
         """Direct column deletion without transaction management."""
         results = {}
 
@@ -600,6 +622,11 @@ class DatabaseDeleter(BaseSchemaManager):
             # Parcours des colonnes
             for column in valid_columns:
                 try:
+                    # Détachement des colonnes enfants d'une hiérarchie avant
+                    # suppression (cascade=True uniquement)
+                    if cascade:
+                        self._clear_child_parent_references(column)
+
                     # Suppression de la colonne
                     dropped_columns = self.data_mgr.drop_columns([column])
 
@@ -730,14 +757,19 @@ class DatabaseDeleter(BaseSchemaManager):
 
     # Méthodes d'analyse des dépendances
     # Méthode auxiliaire d'analyse des dépendances associées à une colonne
-    def _analyze_column_dependencies(self, columns: list[str]) -> dict[str, Any]:
+    def _analyze_column_dependencies(
+        self, columns: list[str], cascade: bool = False
+    ) -> dict[str, Any]:
         """Analyze column dependencies for deletion impact assessment.
 
-        Examines each column for its categorical status, primary key status, and
-        critical references.
+        Examines each column for its categorical status, primary key status,
+        hierarchy parenthood, and critical references.
 
         Args:
             columns: List of column names to analyze.
+            cascade: Whether the caller allows detaching hierarchy children
+                (``parent_name`` set to ``NULL``) instead of treating parenthood as
+                a critical dependency. Defaults to False.
 
         Returns:
             Dependency report containing:
@@ -758,9 +790,8 @@ class DatabaseDeleter(BaseSchemaManager):
             # Parcours des colonnes
             for column in columns:
                 # Initialisation des dépendances de la colonne
-                column_deps = {
+                column_deps: dict[str, Any] = {
                     "is_categorical": self._is_categorical_column(column),
-                    # Placeholder — nécessiterait une analyse des logs
                     "referenced_in_queries": False,
                 }
 
@@ -779,6 +810,34 @@ class DatabaseDeleter(BaseSchemaManager):
                         f"CRITICAL: Column {column} is a primary key - deletion will"
                         f" break data integrity"
                     )
+
+                # Vérification si la colonne est parente d'une autre colonne dans une
+                # hiérarchie : dépendance critique sauf cascade=True.
+                hierarchy_children = [
+                    row[0]
+                    for row in self.conn.execute(
+                        f"SELECT name FROM {self._qualified('metadata')}"
+                        " WHERE parent_name = ?",
+                        [column],
+                    ).fetchall()
+                ]
+                column_deps["hierarchy_children"] = hierarchy_children
+                if hierarchy_children:
+                    if cascade:
+                        # Warning uniquement
+                        dependency_report["warnings"].append(
+                            f"Column {column} is the parent of {hierarchy_children} in"
+                            f" a hierarchy; cascade=True will clear their parent_name"
+                        )
+                    else:
+                        # Dépendantce critique
+                        dependency_report["has_critical_dependencies"] = True
+                        # Warning
+                        dependency_report["warnings"].append(
+                            f"CRITICAL: Column {column} is the parent of"
+                            f" {hierarchy_children} in a hierarchy - deletion would"
+                            f" orphan them (use cascade=True to detach)"
+                        )
 
                 dependency_report["dependencies"][column] = column_deps
 

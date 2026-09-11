@@ -265,3 +265,66 @@ def test_delete_rows_non_categorical_becomes_categorical(
         ).fetchall()
     }
     assert stored_labels == {"val_100", "val_101", "val_102", "val_103"}
+
+
+# ---------------------------------------------------------------------------
+# Tests de delete_columns() sur une colonne parente d'une hiérarchie (§2.5)
+# ---------------------------------------------------------------------------
+
+
+# Test que la suppression d'une colonne parente est refusée sans cascade
+def test_delete_columns_parent_refused_without_cascade(
+    deleter: DatabaseDeleter, built_ducklake_schema: Any
+) -> None:
+    """Test that deleting a hierarchy parent column is refused by default.
+
+    'status' is declared as the parent of 'category'; deleting 'status' without
+    cascade=True must be refused for the whole batch and leave both columns intact.
+
+    Args:
+        deleter: DatabaseDeleter fixture.
+        built_ducklake_schema: DuckDB connection.
+    """
+    # 'category' et 'status' sont déjà catégorielles (seuil=4) : aucun forçage
+    deleter.update_column_metadata("category", parent_name="status")
+
+    result = deleter.delete_columns(["status"], use_transaction=False)
+
+    assert result == {"status": False}
+    columns_after = [
+        row[0]
+        for row in built_ducklake_schema.execute("DESCRIBE fact_table").fetchall()
+    ]
+    assert "status" in columns_after
+
+
+# Test que cascade=True autorise la suppression et détache les enfants
+def test_delete_columns_parent_with_cascade_detaches_children(
+    deleter: DatabaseDeleter, built_ducklake_schema: Any
+) -> None:
+    """Test that cascade=True allows deleting a hierarchy parent and clears
+    the children's parent_name.
+
+    Args:
+        deleter: DatabaseDeleter fixture.
+        built_ducklake_schema: DuckDB connection.
+    """
+    # 'category' et 'status' sont déjà catégorielles (seuil=4) : aucun forçage
+    deleter.update_column_metadata("category", parent_name="status")
+
+    result = deleter.delete_columns(
+        ["status"], use_transaction=False, cascade=True
+    )
+
+    assert result == {"status": True}
+    columns_after = [
+        row[0]
+        for row in built_ducklake_schema.execute("DESCRIBE fact_table").fetchall()
+    ]
+    assert "status" not in columns_after
+
+    # La colonne enfant est toujours là, mais détachée de la hiérarchie
+    parent_of_category = built_ducklake_schema.execute(
+        "SELECT parent_name FROM metadata WHERE name = 'category'"
+    ).fetchone()[0]
+    assert parent_of_category is None
