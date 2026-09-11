@@ -2,6 +2,7 @@
 # Modules de base
 import os
 from collections.abc import Generator
+from datetime import datetime
 from typing import Any
 
 # DuckDB
@@ -127,7 +128,7 @@ def test_init_schema_default_and_custom(ducklake_conn: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-# Test que merge_files s'exécute sans erreur
+# Test que merge_files s'exécute sans erreur et retourne le 4-uplet attendu
 def test_merge_files_executes_without_error(maint: Any, ducklake_conn: Any) -> None:
     """Test that merge_files completes without raising an exception.
 
@@ -137,10 +138,35 @@ def test_merge_files_executes_without_error(maint: Any, ducklake_conn: Any) -> N
     """
     _, table = ducklake_conn
     # Aucune exception ne doit être levée
-    maint.merge_files("main", table)
+    result = maint.merge_files("main", table)
+    schema_name, table_name, files_processed, files_created = result
+    assert schema_name == "main"
+    assert table_name == table
+    assert isinstance(files_processed, int)
+    assert isinstance(files_created, int)
 
 
-# Test que rewrite_data_files s'exécute sans erreur
+# Test que merge_files accepte des valeurs personnalisées des paramètres réels
+def test_merge_files_accepts_custom_parameters(maint: Any, ducklake_conn: Any) -> None:
+    """Test that merge_files accepts min_file_size/max_file_size/max_compacted_files.
+
+    Args:
+        maint: DuckLakeMaintenance fixture.
+        ducklake_conn: Fixture providing (connection, table_name).
+    """
+    _, table = ducklake_conn
+    # Aucune exception ne doit être levée avec des paramètres personnalisés (entiers
+    # en octets — DuckLake rejette une valeur avec unité, cf. spécification §5.5)
+    maint.merge_files(
+        "main",
+        table,
+        min_file_size=1_000,
+        max_file_size=10_000_000,
+        max_compacted_files=10,
+    )
+
+
+# Test que rewrite_data_files s'exécute sans erreur et retourne le 4-uplet attendu
 def test_rewrite_data_files_executes_without_error(
     maint: Any, ducklake_conn: Any
 ) -> None:
@@ -151,7 +177,62 @@ def test_rewrite_data_files_executes_without_error(
         ducklake_conn: Fixture providing (connection, table_name).
     """
     _, table = ducklake_conn
-    maint.rewrite_data_files("main", table)
+    result = maint.rewrite_data_files("main", table)
+    schema_name, table_name, files_processed, files_created = result
+    assert schema_name == "main"
+    assert table_name == table
+
+
+# Test que rewrite_data_files ne réécrit rien sous le seuil de suppression
+def test_rewrite_data_files_zero_when_no_deletions(
+    maint: Any, ducklake_conn: Any, caplog: Any
+) -> None:
+    """Test that rewrite_data_files reports 0 files when nothing crosses the
+    threshold, with an explicit log message (no silent zero, spec §6).
+
+    Args:
+        maint: DuckLakeMaintenance fixture.
+        ducklake_conn: Fixture providing (connection, table_name).
+        caplog: pytest fixture capturing log records.
+    """
+    _, table = ducklake_conn
+    # Aucune suppression n'a eu lieu sur cette table : le seuil par défaut (0.1)
+    # ne peut pas être atteint
+    _, _, files_processed, _ = maint.rewrite_data_files("main", table)
+    assert files_processed == 0
+    assert any("seuil de suppression" in record.message for record in caplog.records)
+
+
+# Test que rewrite_data_files réécrit effectivement après un UPDATE partiel
+def test_rewrite_data_files_low_threshold_rewrites_after_update(
+    tmp_path: Any,
+) -> None:
+    """Test that a low delete_threshold actually rewrites after a partial UPDATE.
+
+    Mirrors the measured scenario from annexe A of the specification: a large
+    enough batch INSERT (inlining disabled) followed by a partial UPDATE produces
+    a real delete-tombstone file that ``rewrite_data_files`` can then absorb — a
+    handful of rows on a freshly-flushed inlined table does not reliably do so.
+
+    Args:
+        tmp_path: pytest temporary directory.
+    """
+    catalog = str(tmp_path / "test.ducklake")
+    data_dir = str(tmp_path / "data")
+    os.makedirs(data_dir)
+    conn = DuckLakeConnector(catalog, data_dir, data_inlining_row_limit=0).connect()
+    conn.execute("CREATE TABLE fact_table (id INTEGER, value DOUBLE)")
+    conn.execute("INSERT INTO fact_table SELECT range, range::DOUBLE FROM range(20000)")
+    # UPDATE partiel : produit un fichier de suppression (delete file)
+    conn.execute("UPDATE fact_table SET value = value + 1 WHERE id < 5000")
+
+    maint = DuckLakeMaintenance(conn)
+    _, _, files_processed, files_created = maint.rewrite_data_files(
+        "main", "fact_table", delete_threshold=0.01
+    )
+    assert files_processed > 0
+    assert files_created > 0
+    conn.close()
 
 
 # Test que expire_snapshots s'exécute sans erreur avec la valeur par défaut
@@ -161,7 +242,8 @@ def test_expire_snapshots_default_days(maint: Any) -> None:
     Args:
         maint: DuckLakeMaintenance fixture.
     """
-    maint.expire_snapshots("main")
+    result = maint.expire_snapshots("main")
+    assert isinstance(result, list)
 
 
 # Test que expire_snapshots accepte une valeur personnalisée de older_than_days
@@ -174,6 +256,17 @@ def test_expire_snapshots_custom_days(maint: Any) -> None:
     maint.expire_snapshots("main", older_than_days=7)
 
 
+# Test que expire_snapshots accepte dry_run
+def test_expire_snapshots_dry_run(maint: Any) -> None:
+    """Test that expire_snapshots accepts and honors dry_run=True.
+
+    Args:
+        maint: DuckLakeMaintenance fixture.
+    """
+    result = maint.expire_snapshots("main", older_than_days=0, dry_run=True)
+    assert isinstance(result, list)
+
+
 # Test que cleanup_files s'exécute sans erreur
 def test_cleanup_files_executes_without_error(maint: Any) -> None:
     """Test that cleanup_files completes without raising an exception.
@@ -181,7 +274,109 @@ def test_cleanup_files_executes_without_error(maint: Any) -> None:
     Args:
         maint: DuckLakeMaintenance fixture.
     """
-    maint.cleanup_files("main")
+    result = maint.cleanup_files("main")
+    assert isinstance(result, list)
+
+
+# Test que cleanup_files accepte dry_run
+def test_cleanup_files_dry_run(maint: Any) -> None:
+    """Test that cleanup_files accepts and honors dry_run=True.
+
+    Args:
+        maint: DuckLakeMaintenance fixture.
+    """
+    result = maint.cleanup_files("main", dry_run=True)
+    assert isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------
+# Tests de flush_inlined_data (§5.2)
+# ---------------------------------------------------------------------------
+
+
+# Test que flush_inlined_data écrit les lignes inlinées et retourne le nombre de
+# lignes vidangées
+def test_flush_inlined_data_writes_inlined_rows(maint: Any, ducklake_conn: Any) -> None:
+    """Test that flush_inlined_data flushes rows inlined by default and returns
+    the count.
+
+    Args:
+        maint: DuckLakeMaintenance fixture.
+        ducklake_conn: Fixture providing (connection, table_name) with default
+            inlining (the fixture's 3-row INSERT is small enough to be inlined).
+    """
+    conn, table = ducklake_conn
+
+    # Avec l'inlining par défaut (non désactivé dans cette fixture), l'insertion de
+    # 3 lignes de la fixture ne produit encore aucun fichier
+    file_count_before = conn.execute(
+        f"SELECT file_count FROM ducklake_table_info('db') WHERE table_name = '{table}'"
+    ).fetchone()[0]
+    assert file_count_before == 0
+
+    rows = maint.flush_inlined_data(table)
+    total_flushed = sum(r[2] for r in rows)
+    assert total_flushed == 3
+
+    file_count_after = conn.execute(
+        f"SELECT file_count FROM ducklake_table_info('db') WHERE table_name = '{table}'"
+    ).fetchone()[0]
+    assert file_count_after == 1
+
+
+# Test que flush_inlined_data sans table vidange l'ensemble du catalogue
+def test_flush_inlined_data_whole_catalog(maint: Any, ducklake_conn: Any) -> None:
+    """Test that flush_inlined_data(table=None) flushes every table.
+
+    Args:
+        maint: DuckLakeMaintenance fixture.
+        ducklake_conn: Fixture providing (connection, table_name).
+    """
+    rows = maint.flush_inlined_data()
+    assert any(r[2] == 3 for r in rows)
+
+
+# Test que flush_inlined_data retourne une liste vide sans lignes inlinées
+def test_flush_inlined_data_nothing_to_flush(maint: Any, ducklake_conn: Any) -> None:
+    """Test that flush_inlined_data returns an empty list once already flushed.
+
+    Args:
+        maint: DuckLakeMaintenance fixture.
+        ducklake_conn: Fixture providing (connection, table_name).
+    """
+    _, table = ducklake_conn
+    maint.flush_inlined_data(table)
+    # Un second appel ne trouve plus rien à vidanger
+    assert maint.flush_inlined_data(table) == []
+
+
+# ---------------------------------------------------------------------------
+# Tests de delete_orphaned_files
+# ---------------------------------------------------------------------------
+
+
+# Test que delete_orphaned_files s'exécute sans erreur en dry_run (défaut)
+def test_delete_orphaned_files_dry_run_default(maint: Any, ducklake_conn: Any) -> None:
+    """Test that delete_orphaned_files defaults to dry_run=True and returns a list.
+
+    Args:
+        maint: DuckLakeMaintenance fixture.
+        ducklake_conn: Fixture providing (connection, table_name).
+    """
+    result = maint.delete_orphaned_files()
+    assert isinstance(result, list)
+
+
+# Test que delete_orphaned_files accepte older_than
+def test_delete_orphaned_files_with_older_than(maint: Any, ducklake_conn: Any) -> None:
+    """Test that delete_orphaned_files accepts an older_than cutoff.
+
+    Args:
+        maint: DuckLakeMaintenance fixture.
+        ducklake_conn: Fixture providing (connection, table_name).
+    """
+    result = maint.delete_orphaned_files(older_than=datetime.now(), dry_run=True)
+    assert isinstance(result, list)
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +395,36 @@ def test_full_maintenance_runs_all_steps(maint: Any, ducklake_conn: Any) -> None
     _, table = ducklake_conn
     # Aucune exception ne doit être levée et toutes les étapes doivent s'exécuter
     maint.full_maintenance("main", table)
+
+
+# Test que full_maintenance vidange les lignes inlinées avant de fusionner/réécrire
+def test_full_maintenance_flushes_before_merge(maint: Any, ducklake_conn: Any) -> None:
+    """Test that flush_inlined_data runs before merge_files in full_maintenance.
+
+    Args:
+        maint: DuckLakeMaintenance fixture.
+        ducklake_conn: Fixture providing (connection, table_name).
+    """
+    _, table = ducklake_conn
+    call_log: list[str] = []
+
+    original_flush = maint.flush_inlined_data
+    original_merge = maint.merge_files
+
+    def tracking_flush(tbl: Any = None) -> Any:
+        call_log.append("flush_inlined_data")
+        return original_flush(tbl)
+
+    def tracking_merge(schema: Any, tbl: Any) -> Any:
+        call_log.append("merge_files")
+        return original_merge(schema, tbl)
+
+    maint.flush_inlined_data = tracking_flush
+    maint.merge_files = tracking_merge
+
+    maint.full_maintenance("main", table)
+
+    assert call_log.index("flush_inlined_data") < call_log.index("merge_files")
 
 
 # Test que full_maintenance continue après un échec partiel

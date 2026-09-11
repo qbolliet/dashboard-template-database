@@ -1,5 +1,6 @@
 # Importation des modules
 # Modules de base
+import json
 import os
 from datetime import datetime
 from typing import Literal
@@ -278,6 +279,7 @@ class DuckLakeTablesBuilder:
         table_name: str | None = "fact_table",
         column_labels: dict[str, str] | None = None,
         partition_by: list[str] | None = None,
+        cluster_by: list[str] | None = None,
     ) -> None:
         """
         Create a fact table in DuckDB with optional Hive partitioning.
@@ -290,10 +292,15 @@ class DuckLakeTablesBuilder:
             partition_by (Optional[List[str]]): Column names to partition the table by
                 using DuckLake's Hive-style partitioning. Defaults to None (no
                 partitioning).
+            cluster_by (Optional[List[str]]): Column names the fact table is
+                physically sorted by at write time (``ORDER BY`` on the initial
+                ``INSERT``/CTAS). Enables DuckLake's per-file min/max pruning
+                (``ducklake_file_column_stats``). Defaults to None (no sort).
 
         Examples:
             >>> builder.create_duckdb_fact_table()
             >>> builder.create_duckdb_fact_table(partition_by=['country', 'year'])
+            >>> builder.create_duckdb_fact_table(cluster_by=['date', 'region'])
         """
         # Création de la table d'informations si elle n'existe pas déjà
         if not hasattr(self.schema_builder, "df_fact"):
@@ -318,6 +325,15 @@ class DuckLakeTablesBuilder:
         # Utilisée dans les deux chemins DDL explicites (avec primary_keys ou avec
         # partition_by).
         needs_explicit_ddl = (primary_keys and len(primary_keys) > 0) or partition_by
+
+        # Clause ORDER BY commune aux deux chemins d'écriture (CTAS et DDL explicite) :
+        # tri physique à l'écriture sur les colonnes de cluster_by, condition du
+        # pruning par fichier.
+        order_clause = (
+            f"ORDER BY {', '.join(quote_ident(c) for c in cluster_by)}"
+            if cluster_by
+            else ""
+        )
 
         if needs_explicit_ddl:
             # Récupération des types SQL pour chaque colonne depuis la table de
@@ -361,6 +377,7 @@ class DuckLakeTablesBuilder:
                 INSERT INTO {qualified_name}
                 SELECT {fact_columns_sql}
                 FROM temp_fact
+                {order_clause}
             """)
 
             # Logging des clés logiques (non contraintes DDL)
@@ -378,6 +395,7 @@ class DuckLakeTablesBuilder:
                 CREATE TABLE {qualified_name} AS
                 SELECT {fact_columns_sql}
                 FROM temp_fact
+                {order_clause}
             """
             self.conn.execute(query)
 
@@ -391,20 +409,27 @@ class DuckLakeTablesBuilder:
     def create_duckdb_dataset_metadata_table(
         self,
         table_name: str | None = "dataset_metadata",
+        cluster_by: list[str] | None = None,
     ) -> None:
         """
         Create the single-row ``dataset_metadata`` table describing the result set.
 
         ``updated_at`` and ``schema_version`` are always filled in; ``label``,
         ``description`` and ``source`` come from the optional builder arguments.
-        ``cluster_by`` is left NULL: physical sort keys are handled separately.
+        ``cluster_by`` is left NULL unless explicitly provided: it is written as a
+        JSON list of column names, kept in sync with the physical sort order applied
+        by ``create_duckdb_fact_table``.
 
         Args:
             table_name (Optional[str]): Name of the table in DuckDB. Defaults to
                 'dataset_metadata'.
+            cluster_by (Optional[List[str]]): Physical sort key of the fact table, as
+                a plain list of column names. Written to ``cluster_by`` as a JSON
+                list; ``None`` writes ``NULL``. Defaults to None.
 
         Examples:
             >>> builder.create_duckdb_dataset_metadata_table()
+            >>> builder.create_duckdb_dataset_metadata_table(cluster_by=['id'])
         """
         # Nom qualifié par le schéma (et le catalogue) cible
         qualified_name = self._qualified(table_name or "dataset_metadata")
@@ -428,7 +453,7 @@ class DuckLakeTablesBuilder:
             f"""
             INSERT INTO {qualified_name}
                 (label, description, source, updated_at, schema_version, cluster_by)
-            VALUES (?, ?, ?, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             [
                 self.dataset_label,
@@ -436,6 +461,7 @@ class DuckLakeTablesBuilder:
                 self.dataset_source,
                 datetime.now(),
                 SCHEMA_VERSION,
+                json.dumps(cluster_by) if cluster_by else None,
             ],
         )
 
@@ -456,6 +482,7 @@ class DuckLakeTablesBuilder:
         check_duplicates: bool = True,
         keep: Literal["any", "none", "first", "last"] = "none",
         partition_by: list[str] | None = None,
+        cluster_by: list[str] | None = None,
     ) -> None:
         """
         Build the entire schema in DuckDB: metadata, fact and dataset_metadata
@@ -481,10 +508,20 @@ class DuckLakeTablesBuilder:
             partition_by (Optional[List[str]]): Column names to partition the fact table
                 by.
                 Passed through to ``create_duckdb_fact_table()``. Defaults to None.
+            cluster_by (Optional[List[str]]): Column names the fact table is
+                physically sorted by at write time. Defaults to the primary keys, in
+                their declared order, when primary keys are set; otherwise no sort is
+                applied. Every column must exist in the source DataFrame. Persisted
+                to ``dataset_metadata.cluster_by`` as a JSON list.
+
+        Raises:
+            ValueError: If ``cluster_by`` references a column absent from the source
+                DataFrame, in addition to the existing primary-key duplicate check.
 
         Examples:
             >>> builder.build_schema()
             >>> builder.build_schema(partition_by=['country'])
+            >>> builder.build_schema(cluster_by=['date', 'region'])
         """
         # Création du schéma cible s'il n'existe pas encore.
         # Utile lorsque la connexion n'a pas été préparée par DuckLakeConnector
@@ -523,6 +560,22 @@ class DuckLakeTablesBuilder:
                     f"Primary keys must be unique."
                 )
 
+        # Résolution de cluster_by : par défaut les clés primaires dans leur ordre de
+        # déclaration (colonnes les plus sélectives filtrées en premier) ; sans clé
+        # primaire, aucun tri par défaut. Une valeur explicite doit référencer des
+        # colonnes existantes du DataFrame source.
+        if cluster_by is None:
+            cluster_by = list(primary_keys) if primary_keys else None
+        else:
+            unknown_cluster_by = [
+                c for c in cluster_by if c not in self.schema_builder.df.columns
+            ]
+            if unknown_cluster_by:
+                raise ValueError(
+                    f"cluster_by columns {unknown_cluster_by} do not exist in the"
+                    f" DataFrame"
+                )
+
         # Création de la table des méta-données
         self.create_duckdb_metadata_table(
             table_name=metadata_table,
@@ -530,16 +583,18 @@ class DuckLakeTablesBuilder:
             column_metadata=column_metadata,
         )
 
-        # Création de la table d'informations avec partitionnement optionnel
+        # Création de la table d'informations avec partitionnement et tri optionnels
         self.create_duckdb_fact_table(
             table_name=fact_table,
             column_labels=column_labels,
             partition_by=partition_by,
+            cluster_by=cluster_by,
         )
 
         # Création de la table des méta-données du jeu de résultats
         self.create_duckdb_dataset_metadata_table(
-            table_name=dataset_metadata_table
+            table_name=dataset_metadata_table,
+            cluster_by=cluster_by,
         )
 
     # Méthode d'affichage du schéma

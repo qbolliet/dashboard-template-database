@@ -16,6 +16,7 @@ from .._internal.managers.transaction import (
     TransactionOperation,
 )
 from ..maintenance.auditor import DatabaseAuditor, ValidationLevel
+from ..maintenance.compaction import DuckLakeMaintenance
 
 # Import des utilitaires
 from ..utils.sql import _build_where_clause
@@ -383,45 +384,55 @@ class DatabaseDeleter(BaseSchemaManager):
             return -1
 
     # Méthode auxiliaire de compaction DuckLake
-    def _run_ducklake_compaction(self, fact_table: str = "fact_table") -> None:
+    def _run_ducklake_compaction(
+        self,
+        fact_table: str = "fact_table",
+        delete_threshold: float = 0.1,
+    ) -> None:
         """Trigger DuckLake compaction on the fact table after a successful deletion.
 
-        Merges small adjacent Parquet delta files and rewrites delete files (tombstones)
-        to maintain optimal read performance. Failures are non-fatal: a warning is
-        logged and execution continues normally.
+        Merges small adjacent Parquet delta files and rewrites files whose
+        deleted-row share exceeds ``delete_threshold`` (tombstone removal), to
+        maintain optimal read performance. Delegates to ``DuckLakeMaintenance``;
+        failures are non-fatal there (a warning is logged, zero-file results are
+        logged explicitly) so this method itself never raises.
+
+        Never calls ``expire_snapshots``, ``cleanup_files`` or
+        ``delete_orphaned_files``: those destroy time travel or are irreversible, and
+        are reserved for planned maintenance (``DuckLakeMaintenance.full_maintenance``)
+        with an explicit retention.
 
         Args:
             fact_table: Name of the fact table to compact. Defaults to ``'fact_table'``.
+            delete_threshold: Rewrite files whose deleted-row share exceeds this
+                fraction (0-1). Defaults to 0.1 — without an explicit value this
+                procedure is a measured no-op. Particularly relevant here since a
+                deletion is exactly what raises a file's deleted-row share.
 
         Examples:
             >>> deleter._run_ducklake_compaction()
-            >>> deleter._run_ducklake_compaction('my_fact_table')
+            >>> deleter._run_ducklake_compaction('my_fact_table', delete_threshold=0.3)
         """
-        # Extraction des alias et du schéma
-        alias = self.catalog_alias
-        schema = self.schema
-        try:
-            # Fusion des petits fichiers delta adjacents
-            # Note : les table functions DuckLake sont enregistrées dans le catalogue
-            # mémoire
-            # (où l'extension est chargée), pas dans le catalogue attaché. L'alias du
-            # catalogue
-            # doit être passé en premier argument, et non utilisé comme préfixe.
-            self.conn.execute(
-                f"CALL ducklake_merge_adjacent_files('{alias}', '{fact_table}', schema"
-                f":= '{schema}')"
-            )
-            # Réécriture des fichiers de suppression (delete files) pour optimiser les
-            # lectures
-            self.conn.execute(
-                f"CALL ducklake_rewrite_data_files('{alias}', '{fact_table}', schema"
-                f":= '{schema}')"
-            )
-            self.logger.info(f"DuckLake finished for '{fact_table}'")
-        except Exception as e:
-            # Erreur non bloquante : la compaction est une optimisation, pas une étape
-            # critique
-            self.logger.warning(f"Ducklake compaction failed : {e}")
+        # Initialisation du mainteneur
+        maintenance = DuckLakeMaintenance(
+            self.conn, catalog_alias=self.catalog_alias, schema=self.schema
+        )
+        # merge_files/rewrite_data_files sont déjà non bloquantes (try/except interne,
+        # compteurs réels journalisés y compris les zéros) : aucun try/except
+        # supplémentaire n'est nécessaire ici.
+        _, _, merge_processed, merge_created = maintenance.merge_files(
+            self.schema, fact_table
+        )
+        _, _, rewrite_processed, rewrite_created = maintenance.rewrite_data_files(
+            self.schema, fact_table, delete_threshold=delete_threshold
+        )
+        # Logging
+        self.logger.info(
+            f"Compaction DuckLake finished for '{fact_table}' : merge"
+            f" {merge_processed} -> {merge_created} file(s), rewrite"
+            f" {rewrite_processed} -> {rewrite_created} file(s)"
+            f" (delete_threshold={delete_threshold})"
+        )
 
     # Méthode principale de suppression de colonnes
     def delete_columns(

@@ -575,6 +575,35 @@ class DataManager(BaseSchemaManager):
             self.logger.error(f"Failed to update column type for {column_name}: {e}")
             return False
 
+    # Méthode auxiliaire de construction de la clause ORDER BY d'un lot d'écriture
+    def _cluster_by_order_clause(self, batch_columns: list[str]) -> str:
+        """
+        Build the ``ORDER BY`` clause sorting a write batch by ``cluster_by``.
+
+        Reads ``cluster_by`` from ``dataset_metadata`` and keeps only the columns
+        actually present in this batch (a partial-column batch, e.g. from
+        ``add_columns``, may not carry every cluster_by column), preserving the
+        declared ``cluster_by`` order.
+
+        Args:
+            batch_columns: Columns present in the DataFrame being written.
+
+        Returns:
+            The ``ORDER BY ...`` SQL clause, or ``""`` when no cluster_by column is
+            present in this batch.
+        """
+        # Colonnes de tri persistées (ou None si aucune n'est définie)
+        cluster_by = self._get_cluster_by_columns()
+        if not cluster_by:
+            return ""
+        # Restriction aux colonnes réellement présentes dans ce lot, en préservant
+        # l'ordre déclaré de cluster_by
+        batch_columns_set = set(batch_columns)
+        applicable = [c for c in cluster_by if c in batch_columns_set]
+        if not applicable:
+            return ""
+        return f"ORDER BY {', '.join(quote_ident(c) for c in applicable)}"
+
     # Méthodes privées pour le traitement par lots
     # Méthode auxiliaire d'insertion par batch
     def _batch_insert_data(self, df: nw.DataFrame[Any]) -> int:
@@ -622,9 +651,15 @@ class DataManager(BaseSchemaManager):
             # Insertion des données.
             # Liste de colonnes issue des données : identifiants entre guillemets.
             column_list = ", ".join(quote_ident(c) for c in df.columns)
+            # Tri du lot selon cluster_by (dataset_metadata) avant écriture, condition
+            # du pruning par fichier. Seules les colonnes de
+            # cluster_by réellement présentes dans ce lot sont conservées, dans l'ordre
+            # de cluster_by.
+            order_clause = self._cluster_by_order_clause(df.columns)
             insert_query = f"""
                 INSERT INTO {self._qualified("fact_table")} ({column_list})
                 SELECT {column_list} FROM temp_insert
+                {order_clause}
             """
             self.conn.execute(insert_query)
 
@@ -733,6 +768,9 @@ class DataManager(BaseSchemaManager):
             initial_count = _ic_row[0] if _ic_row is not None else 0
 
             column_list = ", ".join(quote_ident(c) for c in df.columns)
+            # Tri des seules lignes nouvellement insérées selon cluster_by : la
+            # branche UPDATE ... FROM ci-dessus n'a pas de notion d'ordre de lignes.
+            order_clause = self._cluster_by_order_clause(df.columns)
             insert_query = f"""
                 INSERT INTO {fact_table} ({column_list})
                 SELECT {column_list} FROM temp_upsert t
@@ -740,6 +778,7 @@ class DataManager(BaseSchemaManager):
                     SELECT 1 FROM {fact_table} f
                     WHERE {merge_condition}
                 )
+                {order_clause}
             """
             self.conn.execute(insert_query)
 

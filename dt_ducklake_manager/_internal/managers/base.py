@@ -1,5 +1,6 @@
 # Importation des modules
 # Modules de base
+import json
 import os
 import threading
 import warnings
@@ -103,9 +104,7 @@ class BaseSchemaManager(ABC):
 
         # Initialisation du logger nommé pour traçabilité des opérations.
         # Chemin par défaut centralisé dans utils.logger : <cwd>/logs/<name>.log.
-        self.logger = _init_logger(
-            filename=log_filename, name="base_schema_manager"
-        )
+        self.logger = _init_logger(filename=log_filename, name="base_schema_manager")
 
         # Cache thread-safe pour optimiser les accès aux métadonnées
         self._metadata_cache: nw.DataFrame[Any] | None = None
@@ -327,6 +326,76 @@ class BaseSchemaManager(ABC):
         ).fetchall()
         return [row[0] for row in result]
 
+    # Méthode de lecture des colonnes de tri physique (cluster_by)
+    def _get_cluster_by_columns(self) -> list[str] | None:
+        """
+        Get the physical sort key of the fact table from ``dataset_metadata``.
+
+        Returns:
+            The ``cluster_by`` column list, or None if ``dataset_metadata`` doesn't
+            exist yet or its ``cluster_by`` value is NULL.
+
+        Example:
+            >>> manager._get_cluster_by_columns()
+            ['date', 'region']
+        """
+        # Absence de table dataset_metadata (ex. schéma pas encore construit) : pas de
+        # tri connu
+        if not self._table_exists("dataset_metadata"):
+            return None
+        # Lecture de l'unique ligne de dataset_metadata
+        result = self.conn.execute(
+            f"SELECT cluster_by FROM {self._qualified('dataset_metadata')}"
+        ).fetchone()
+        if result is None or result[0] is None:
+            return None
+        # Décodage de la liste JSON persistée
+        decoded: list[str] = json.loads(result[0])
+        return decoded
+
+    # Méthode de mise à jour du tri physique (cluster_by) sur une base existante
+    def update_cluster_by(self, columns: list[str]) -> None:
+        """
+        Correct the physical sort key (``cluster_by``) recorded for the fact table.
+
+        Only updates ``dataset_metadata.cluster_by``: existing data files are left
+        untouched, so file pruning does not improve until the fact table is
+        physically reordered (``DuckLakeMaintenance.recluster``). Future writes
+        (inserts, upserts) sort themselves by the new value.
+
+        Args:
+            columns: Non-empty list of column names, in the desired sort order. Every
+                column must exist in the fact table.
+
+        Raises:
+            ValueError: If ``columns`` is empty, or references a column absent from
+                the fact table.
+
+        Example:
+            >>> manager.update_cluster_by(['date', 'region'])
+        """
+        # Une liste vide n'a pas de sens : ce n'est pas équivalent à "aucun tri" (qui
+        # se représente par NULL, non par une correction explicite)
+        if not columns:
+            raise ValueError("columns must not be empty")
+
+        # Validation de l'existence de chaque colonne dans la table des faits
+        existing_columns = set(self._get_fact_table_columns())
+        unknown = [c for c in columns if c not in existing_columns]
+        if unknown:
+            raise ValueError(
+                f"cluster_by columns {unknown} do not exist in the fact table"
+            )
+
+        # Écriture de la nouvelle valeur, sans réécriture des données
+        self.conn.execute(
+            f"UPDATE {self._qualified('dataset_metadata')} SET cluster_by = ?",
+            [json.dumps(columns)],
+        )
+
+        # Logging
+        self.logger.info(f"Updated cluster_by to {columns}")
+
     # Méthodes de gestion des métadonnées
     # Méthode d'ajout d'une colonne aux méta-données
     def _add_column_to_metadata(
@@ -504,7 +573,8 @@ class BaseSchemaManager(ABC):
         # Extraction du nouveau parent
         new_parent = fields.get("parent_name")
         if "parent_name" in fields and new_parent is not None:
-            # Vérification que la colonne parent existe dans la table des métadonnées (et est donc une colonne valide de la table des faits)
+            # Vérification que la colonne parent existe dans la table des
+            # métadonnées (et est donc une colonne valide de la table des faits)
             _prow = self.conn.execute(
                 f"SELECT COUNT(*) FROM {metadata_table} WHERE name = ?", [new_parent]
             ).fetchone()
@@ -734,8 +804,7 @@ class BaseSchemaManager(ABC):
         self._invalidate_metadata_cache()
         # Logging
         self.logger.info(
-            f"Type conflict resolution for {column}: {current_type} ->"
-            f" {resolved_type}"
+            f"Type conflict resolution for {column}: {current_type} -> {resolved_type}"
         )
 
     # Méthode utilitaire pour les colonnes contenant uniquement des valeurs nulles
@@ -810,8 +879,7 @@ class BaseSchemaManager(ABC):
 
             # Sélection des colonnes textuelles dont le statut n'a pas été forcé
             candidates = current_metadata.filter(
-                (nw.col("sql_type") == "VARCHAR")
-                & (~nw.col("is_categorical_forced"))
+                (nw.col("sql_type") == "VARCHAR") & (~nw.col("is_categorical_forced"))
             )
 
             # Colonnes réellement présentes dans la table des faits

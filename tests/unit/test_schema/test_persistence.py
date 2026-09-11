@@ -1,6 +1,9 @@
 # Importation des modules
 # Modules de base
+import json
+import os
 import warnings
+from pathlib import Path
 
 # DuckDB
 import duckdb
@@ -787,3 +790,221 @@ def test_build_schema_hierarchy_cycle_raises(sample_df: pl.DataFrame) -> None:
 
     with pytest.raises(ValueError, match="Cycle detected"):
         builder.build_schema()
+
+
+# ---------------------------------------------------------------------------
+# Tests de cluster_by (§5.3)
+# ---------------------------------------------------------------------------
+
+
+# Test que cluster_by par défaut reprend les clés primaires dans leur ordre
+def test_build_schema_cluster_by_defaults_to_primary_keys(
+    sample_df: pl.DataFrame,
+) -> None:
+    """Test that cluster_by defaults to the primary keys in declared order.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        builder = DuckLakeTablesBuilder(
+            sample_df, categorical_threshold=4, primary_keys=["id"]
+        )
+    builder.build_schema()
+
+    row = builder.conn.execute("SELECT cluster_by FROM dataset_metadata").fetchone()
+    assert json.loads(row[0]) == ["id"]
+
+
+# Test qu'aucune clé primaire ne produit un cluster_by NULL par défaut
+def test_build_schema_cluster_by_none_without_primary_keys(
+    sample_df: pl.DataFrame,
+) -> None:
+    """Test that cluster_by stays NULL by default when there is no primary key.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        builder = DuckLakeTablesBuilder(sample_df, categorical_threshold=4)
+    builder.build_schema()
+
+    row = builder.conn.execute("SELECT cluster_by FROM dataset_metadata").fetchone()
+    assert row[0] is None
+
+
+# Test qu'une valeur explicite de cluster_by est persistée telle quelle
+def test_build_schema_cluster_by_explicit_value(sample_df: pl.DataFrame) -> None:
+    """Test that an explicit cluster_by is persisted as the given JSON list.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        builder = DuckLakeTablesBuilder(
+            sample_df, categorical_threshold=4, primary_keys=["id"]
+        )
+    builder.build_schema(cluster_by=["category", "id"])
+
+    row = builder.conn.execute("SELECT cluster_by FROM dataset_metadata").fetchone()
+    assert json.loads(row[0]) == ["category", "id"]
+
+
+# Test qu'une colonne de cluster_by inconnue lève une ValueError
+def test_build_schema_cluster_by_unknown_column_raises(
+    sample_df: pl.DataFrame,
+) -> None:
+    """Test that an unknown cluster_by column aborts build_schema with ValueError.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        builder = DuckLakeTablesBuilder(
+            sample_df, categorical_threshold=4, primary_keys=["id"]
+        )
+
+    with pytest.raises(ValueError, match="cluster_by columns"):
+        builder.build_schema(cluster_by=["not_a_column"])
+
+
+# Test que la table des faits est effectivement triée selon cluster_by
+def test_build_schema_fact_table_sorted_by_cluster_by(
+    sample_df: pl.DataFrame,
+) -> None:
+    """Test that the fact table rows are physically written in cluster_by order.
+
+    Args:
+        sample_df: Sample polars DataFrame.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        builder = DuckLakeTablesBuilder(
+            sample_df, categorical_threshold=4, primary_keys=["id"]
+        )
+    # Tri décroissant improbable par défaut (id croissant) : category d'abord
+    builder.build_schema(cluster_by=["category"])
+
+    categories = [
+        row[0]
+        for row in builder.conn.execute("SELECT category FROM fact_table").fetchall()
+    ]
+    assert categories == sorted(categories)
+
+
+# Test que create_duckdb_dataset_metadata_table appelée directement avec cluster_by
+# persiste la liste JSON fournie
+def test_create_duckdb_dataset_metadata_table_with_cluster_by(
+    ducklake_builder: DuckLakeTablesBuilder,
+) -> None:
+    """Test that an explicit cluster_by reaches dataset_metadata as a JSON list.
+
+    Args:
+        ducklake_builder: DuckLakeTablesBuilder fixture.
+    """
+    ducklake_builder.create_duckdb_dataset_metadata_table(cluster_by=["id", "date"])
+
+    result = ducklake_builder.conn.execute(
+        "SELECT cluster_by FROM dataset_metadata"
+    ).fetchone()
+    assert json.loads(result[0]) == ["id", "date"]
+
+
+# Test que le tri physique produit des fichiers Parquet dont les plages ne se
+# recouvrent pas (élagage par fichier, §5.3)
+@pytest.mark.skipif(
+    not _ducklake_available(),
+    reason="Extension ducklake non disponible dans cet environnement",
+)
+def test_build_schema_cluster_by_produces_non_overlapping_files(
+    tmp_path: Path,
+) -> None:
+    """Test that cluster_by-sorted data yields files with non-overlapping ranges.
+
+    Attaches a real on-disk DuckLake catalog with inlining disabled and a very
+    small target file size, so a moderately sized DataFrame lands in several
+    Parquet files. Reads them back via ``read_parquet`` and checks that the
+    per-file min/max ranges of the cluster column do not overlap — the physical
+    condition for DuckLake's file-pruning to work (annexe A of the specification).
+
+    With the engine's default parallelism, DuckDB spreads a sorted INSERT across
+    files non-monotonically (measured, annexe A — the same effect documented for
+    ``recluster``); ``SET threads = 1`` around the write is the same technique the
+    specification itself uses to observe the physical effect deterministically. It
+    is applied only in this test, not in production code (single-threaded writes
+    are prompt 9's ``recluster`` concern, not this one).
+
+    Args:
+        tmp_path: pytest temporary directory.
+    """
+    from dt_ducklake_manager.connection import DuckLakeConnector
+
+    catalog = str(tmp_path / "test.ducklake")
+    data_dir = str(tmp_path / "data")
+    os.makedirs(data_dir)
+
+    conn = DuckLakeConnector(
+        catalog,
+        data_dir,
+        data_inlining_row_limit=0,
+        ducklake_options={"target_file_size": "1MB"},
+    ).connect()
+
+    # Grand nombre de lignes pour dépasser largement la petite taille de fichier
+    # cible en un seul INSERT
+    n = 500_000
+    df = pl.DataFrame(
+        {
+            "id": list(range(n)),
+            "value": [float(i) for i in range(n)],
+        }
+    )
+
+    conn.execute("SET threads = 1")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        builder = DuckLakeTablesBuilder(
+            df,
+            categorical_threshold=4,
+            primary_keys=["id"],
+            connection=conn,
+            catalog_alias="db",
+        )
+    builder.build_schema(cluster_by=["id"])
+
+    # Fichiers réellement associés à fact_table (et non à metadata/dataset_metadata,
+    # qui partagent le même data_path) : ducklake_list_files est la source fiable,
+    # un glob sur data_path mélangerait les schémas des différentes tables.
+    files = [
+        row[0]
+        for row in conn.execute(
+            "SELECT data_file FROM ducklake_list_files('db', 'fact_table',"
+            " schema := 'main')"
+        ).fetchall()
+    ]
+    assert len(files) > 1, "expected build_schema to produce several Parquet files"
+
+    # Un fichier résiduel vide est possible (mesuré, annexe A) : exclu du contrôle
+    # de recouvrement, qui ne porte que sur des plages réelles.
+    ranges = sorted(
+        row
+        for row in (
+            conn.execute(
+                f"SELECT min(id) AS lo, max(id) AS hi FROM read_parquet('{f}')"
+            ).fetchone()
+            for f in files
+        )
+        if row is not None and row[0] is not None
+    )
+
+    # Les plages [lo, hi] ne doivent pas se chevaucher une fois triées par lo
+    for (lo, hi), (next_lo, _next_hi) in zip(ranges, ranges[1:]):
+        assert hi <= next_lo, (
+            f"overlapping file ranges: ({lo}, {hi}) vs starting at {next_lo}"
+        )
+
+    conn.close()

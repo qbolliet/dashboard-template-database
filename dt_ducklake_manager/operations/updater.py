@@ -15,6 +15,7 @@ from .._internal.managers.base import BaseSchemaManager
 from .._internal.managers.data import DataManager
 from .._internal.managers.transaction import TransactionManager, TransactionOperation
 from ..maintenance.auditor import DatabaseAuditor, IssueSeverity, ValidationLevel
+from ..maintenance.compaction import DuckLakeMaintenance
 
 # Import des utilitaires
 from ..utils.sql import (
@@ -586,9 +587,7 @@ class DatabaseUpdater(BaseSchemaManager):
             changed = self._refresh_categorical_flags()
             # Logging
             if changed:
-                self.logger.info(
-                    f"Categorical status refreshed for columns: {changed}"
-                )
+                self.logger.info(f"Categorical status refreshed for columns: {changed}")
             return True
 
         except Exception as e:
@@ -618,9 +617,7 @@ class DatabaseUpdater(BaseSchemaManager):
             primary_keys = self._get_primary_key_columns()
 
             # Vérification que les clés primaires sont présentes dans le DataFrame
-            missing_keys = [
-                key for key in primary_keys if key not in update_df.columns
-            ]
+            missing_keys = [key for key in primary_keys if key not in update_df.columns]
             if missing_keys:
                 self.logger.error(f"Primary keys missing in DataFrame: {missing_keys}")
                 return False
@@ -681,9 +678,7 @@ class DatabaseUpdater(BaseSchemaManager):
             primary_keys = self._get_primary_key_columns()
 
             # Vérification que les clés primaires sont présentes dans le DataFrame
-            missing_keys = [
-                key for key in primary_keys if key not in update_df.columns
-            ]
+            missing_keys = [key for key in primary_keys if key not in update_df.columns]
             if missing_keys:
                 self.logger.error(f"Primary keys missing in DataFrame: {missing_keys}")
                 return False
@@ -774,8 +769,7 @@ class DatabaseUpdater(BaseSchemaManager):
             # chaque colonne du DataFrame (alias upd) est comparée à la fact_table
             # (alias f).
             conditions = " AND ".join(
-                f"f.{quote_ident(key)} = upd.{quote_ident(key)}"
-                for key in primary_keys
+                f"f.{quote_ident(key)} = upd.{quote_ident(key)}" for key in primary_keys
             )
 
             # Enregistrement dans DuckDB
@@ -818,46 +812,57 @@ class DatabaseUpdater(BaseSchemaManager):
             return df.clone(), df.head(0)
 
     # Méthode auxiliaire de compaction DuckLake
-    def _run_ducklake_compaction(self, fact_table: str = "fact_table") -> None:
+    def _run_ducklake_compaction(
+        self,
+        fact_table: str = "fact_table",
+        delete_threshold: float = 0.1,
+    ) -> None:
         """Trigger DuckLake compaction on the fact table after a successful update.
 
-        Merges small adjacent Parquet delta files and rewrites delete files to
-        maintain optimal read performance. Failures are non-fatal: a warning is
-        logged and execution continues normally.
+        Merges small adjacent Parquet delta files and rewrites files whose
+        deleted-row share exceeds ``delete_threshold``, to maintain optimal read
+        performance. Delegates to ``DuckLakeMaintenance``; failures are non-fatal
+        there (a warning is logged, zero-file results are logged explicitly) so this
+        method itself never raises.
+
+        Never calls ``expire_snapshots``, ``cleanup_files`` or
+        ``delete_orphaned_files``: those destroy time travel or are irreversible, and
+        are reserved for planned maintenance (``DuckLakeMaintenance.full_maintenance``)
+        with an explicit retention.
 
         The catalog alias and schema are read from ``self.catalog_alias``
         and ``self.schema``, which can be set at construction time.
 
         Args:
             fact_table: Name of the fact table to compact. Defaults to ``'fact_table'``.
+            delete_threshold: Rewrite files whose deleted-row share exceeds this
+                fraction (0-1). Defaults to 0.1 — without an explicit value this
+                procedure is a measured no-op.
 
         Examples:
             >>> updater._run_ducklake_compaction()
-            >>> updater._run_ducklake_compaction('my_fact_table')
+            >>> updater._run_ducklake_compaction('my_fact_table', delete_threshold=0.3)
         """
-        # Extraction des alias et du schéma
-        alias = self.catalog_alias
-        schema = self.schema
-        try:
-            # Fusion des petits fichiers delta adjacents
-            # Note : les table functions DuckLake sont enregistrées dans le catalogue
-            # mémoire
-            # (où l'extension est chargée), pas dans le catalogue attaché.
-            self.conn.execute(
-                f"CALL ducklake_merge_adjacent_files('{alias}', '{fact_table}', schema"
-                f":= '{schema}')"
-            )
-            # Réécriture des fichiers de suppression (delete files) pour optimiser les
-            # lectures
-            self.conn.execute(
-                f"CALL ducklake_rewrite_data_files('{alias}', '{fact_table}', schema"
-                f":= '{schema}')"
-            )
-            self.logger.info(f"Compaction DuckLake is finished for '{fact_table}'")
-        except Exception as e:
-            # Erreur non bloquante : la compaction est une optimisation, pas une étape
-            # critique
-            self.logger.warning(f"Compaction DuckLake failed : {e}")
+        # Initialisation du mainteneur
+        maintenance = DuckLakeMaintenance(
+            self.conn, catalog_alias=self.catalog_alias, schema=self.schema
+        )
+        # merge_files/rewrite_data_files sont déjà non bloquantes (try/except interne,
+        # compteurs réels journalisés y compris les zéros) : aucun try/except
+        # supplémentaire n'est nécessaire ici.
+        _, _, merge_processed, merge_created = maintenance.merge_files(
+            self.schema, fact_table
+        )
+        _, _, rewrite_processed, rewrite_created = maintenance.rewrite_data_files(
+            self.schema, fact_table, delete_threshold=delete_threshold
+        )
+        # Logging
+        self.logger.info(
+            f"Compaction DuckLake finished for '{fact_table}' : merge"
+            f" {merge_processed} -> {merge_created} file(s), rewrite"
+            f" {rewrite_processed} -> {rewrite_created} file(s)"
+            f" (delete_threshold={delete_threshold})"
+        )
 
     # Méthodes de rollback
     # Méthode auxiliaire de rollback des changements de métadonnées

@@ -1,7 +1,51 @@
+"""
+Physical maintenance of a DuckLake catalog.
+
+DuckLake files are immutable : every UPDATE/DELETE
+produces new Parquet delta files and, for a partial deletion, a
+``-delete.parquet`` tombstone file, while the old file stays referenced by prior
+snapshots (time travel). Left alone, small files and tombstones accumulate and
+degrade read performance. Per procedure — effect / when / risk:
+
+- ``rewrite_data_files(delete_threshold)`` — rewrites files whose deleted-row
+  share exceeds the threshold; **without an explicit threshold it is a no-op**.
+  After every update/delete
+  (``delete_threshold`` 0.1-0.3). Risk: none (old files stay readable via time
+  travel).
+- ``merge_files(min_file_size)`` — merges adjacent files smaller than
+  ``min_file_size``. Once many small batches have accumulated; after
+  ``recluster``. Risk: none.
+- ``flush_inlined_data`` — writes inlined catalog rows out to Parquet. Planned
+  maintenance; before reading files directly. Risk: none.
+- ``recluster(order_by)`` — rewrites the whole table in
+  ``cluster_by`` order. When file overlap degrades pruning, typically after N
+  updates. Risk: full rewrite, doubles space until cleanup.
+- ``repartition`` — changes partitioning and rewrites. Filter strategy change.
+  Risk: full rewrite, doubles space until cleanup.
+- ``expire_snapshots(older_than)`` — makes snapshots older than the cutoff
+  unreachable. **Planned maintenance only**, explicit retention (days). Risk:
+  **destroys time travel** beyond the retention.
+- ``cleanup_files`` — deletes files no snapshot references anymore. After
+  ``expire_snapshots``; the only step that actually frees space (measured).
+  Risk: irreversible.
+- ``delete_orphaned_files`` — deletes files under ``data_path`` unknown to the
+  catalog. After an incident (interrupted transaction, manual copy); always
+  ``dry_run`` first. Risk: irreversible.
+
+Cycle: *rewrite* (rewrite/merge/flush) after every write -> *expire* and
+*cleanup* only in planned maintenance. ``full_maintenance`` runs the safe,
+always-after-write steps (flush -> merge -> rewrite) plus expire/cleanup with an
+explicit retention — callers that only want the safe steps should call
+``merge_files``/``rewrite_data_files``/``flush_inlined_data`` directly instead
+(see ``DatabaseUpdater``/``DatabaseDeleter``, which never call
+``expire_snapshots``/``cleanup_files``/``delete_orphaned_files``).
+"""
+
 # Importation des modules
 # Modules de base
 import os
 from datetime import datetime, timedelta
+from typing import Any
 
 # DuckDB
 import duckdb
@@ -17,8 +61,9 @@ class DuckLakeMaintenance:
 
     DuckLake writes small Parquet delta files and delete tombstone files for every
     UPDATE/DELETE/MERGE operation. Over time, many small files accumulate and degrade
-    sequential read performance. This class wraps the four DuckLake maintenance
-    procedures that compact those files back into larger, efficient Parquet files.
+    sequential read performance. This class wraps DuckLake's maintenance procedures
+    that compact those files back into larger, efficient Parquet files, flush inlined
+    rows, and (planned maintenance only) reclaim space from expired snapshots.
 
     All methods are non-fatal: errors are logged as warnings and execution continues,
     so a failure in one step does not prevent the remaining steps from running.
@@ -76,79 +121,269 @@ class DuckLakeMaintenance:
 
         # Initialisation du logger nommé.
         # Chemin par défaut centralisé dans utils.logger : <cwd>/logs/<name>.log.
-        self.logger = _init_logger(
-            filename=log_filename, name="ducklake_maintenance"
-        )
+        self.logger = _init_logger(filename=log_filename, name="ducklake_maintenance")
 
     # ---------------------------------------------------------------------------
     # Méthodes de maintenance individuelles
     # ---------------------------------------------------------------------------
 
     # Fusion des petits fichiers Parquet adjacents
-    def merge_files(self, schema: str, table: str) -> None:
+    def merge_files(
+        self,
+        schema: str,
+        table: str,
+        min_file_size: int = 100_000_000,
+        max_file_size: int = 500_000_000,
+        max_compacted_files: int = 100,
+    ) -> tuple[str, str, int, int]:
         """
         Merge small adjacent Parquet files into larger files.
 
         Each INSERT/UPDATE/MERGE in DuckLake produces a small Parquet file.
         Over time, a table may consist of hundreds of tiny files, which forces
         DuckDB to open many file handles during a sequential scan. This procedure
-        merges adjacent files into larger chunks, reducing scan overhead.
+        merges files smaller than ``min_file_size`` into larger chunks, reducing
+        scan overhead.
 
         Args:
             schema (str): DuckLake schema name (e.g. ``'main'``).
             table (str): Table name to compact (e.g. ``'fact_table'``).
+            min_file_size (int): Files smaller than this (in **bytes** — DuckLake
+                rejects a value with a unit, e.g. ``'1KB'``) are candidates for
+                merging. Defaults to 100 000 000 (100MB), aligned with the
+                recommended ``target_file_size`` (:data:`RECOMMENDED_DUCKLAKE_OPTIONS`
+                in ``connection.connector``): files below the target get merged.
+            max_file_size (int): Cap, in bytes, on the size of a merged output file.
+                Defaults to 500 000 000 (500MB, 5x the target) to leave room for
+                combining several under-target files without producing oversized
+                ones.
+            max_compacted_files (int): Maximum number of small files combined into
+                one output file. Defaults to 100.
+
+        Returns:
+            tuple[str, str, int, int]: ``(schema_name, table_name, files_processed,
+            files_created)`` as reported by DuckLake, or ``(schema, table, 0, 0)`` if
+            the call fails (logged as a warning, non-fatal).
 
         Examples:
             >>> maint.merge_files('main', 'fact_table')
+            >>> maint.merge_files('main', 'fact_table', min_file_size=50_000_000)
         """
         try:
-            # Exécution de la fusion des fichiers
-            # Note : les table functions DuckLake vivent dans le catalogue mémoire.
-            self.conn.execute(
-                f"CALL ducklake_merge_adjacent_files('{self.catalog_alias}', '{table}',"
+            # Exécution de la fusion des fichiers.
+            # min_file_size / max_file_size / max_compacted_files / schema sont des
+            # paramètres nommés uniquement.
+            result = self.conn.execute(
+                f"SELECT * FROM ducklake_merge_adjacent_files('{self.catalog_alias}',"
+                f" '{table}', min_file_size := {min_file_size}, max_file_size :="
+                f" {max_file_size}, max_compacted_files := {max_compacted_files},"
                 f" schema := '{schema}')"
+            ).fetchone()
+            schema_name, table_name, files_processed, files_created = (
+                result if result is not None else (schema, table, 0, 0)
             )
-            # Logging
-            self.logger.info(
-                f"The merge of the Parquet files is finished : {schema}.{table}"
-            )
+            # Logging : un zéro est toujours explicité
+            if files_processed == 0:
+                self.logger.info(
+                    f"merge_files {schema}.{table} : 0 file merged (no"
+                    f" file under the threshold min_file_size={min_file_size})"
+                )
+            else:
+                self.logger.info(
+                    f"merge_files {schema}.{table} : {files_processed} file(s)"
+                    f" processed, {files_created} files(s) created(s)"
+                )
+            return schema_name, table_name, files_processed, files_created
         except Exception as e:
             # Logging
             self.logger.warning(f"merge_files failed for {schema}.{table} : {e}")
+            return schema, table, 0, 0
 
     # Réécriture des fichiers contenant des suppressions
-    def rewrite_data_files(self, schema: str, table: str) -> None:
+    def rewrite_data_files(
+        self,
+        schema: str,
+        table: str,
+        delete_threshold: float = 0.1,
+    ) -> tuple[str, str, int, int]:
         """
         Rewrite data files to remove deleted rows from Parquet files.
 
         DuckLake represents DELETE and UPDATE operations as separate delete-tombstone
         files. These tombstones accumulate and must be applied as a filter on every
-        read. This procedure rewrites the underlying Parquet files to physically
-        remove deleted rows, eliminating the tombstone overhead.
+        read. This procedure rewrites files whose deleted-row share exceeds
+        ``delete_threshold``, physically removing deleted rows.
+
+        **Without an explicit ``delete_threshold`` this procedure is a true no-op**
+        (measured: an empty result set, even at 25% deletions) — this is why it is
+        always passed here rather than left to the engine default.
 
         Args:
             schema (str): DuckLake schema name (e.g. ``'main'``).
             table (str): Table name to rewrite (e.g. ``'fact_table'``).
+            delete_threshold (float): Rewrite files whose deleted-row share exceeds
+                this fraction (0-1). Defaults to 0.1 (per the specification's
+                recommended 0.1-0.3 range for after-write compaction).
+
+        Returns:
+            tuple[str, str, int, int]: ``(schema_name, table_name, files_processed,
+            files_created)`` as reported by DuckLake, or ``(schema, table, 0, 0)`` if
+            no file crosses the threshold or the call fails (the latter logged as a
+            warning, non-fatal).
 
         Examples:
             >>> maint.rewrite_data_files('main', 'fact_table')
+            >>> maint.rewrite_data_files('main', 'fact_table', delete_threshold=0.3)
         """
         try:
-            # Exécution de la réécriture des fichiers
-            self.conn.execute(
-                f"CALL ducklake_rewrite_data_files('{self.catalog_alias}', '{table}',"
-                f"schema := '{schema}')"
-            )
+            # Exécution de la réécriture des fichiers.
+            # delete_threshold et schema sont des paramètres nommés uniquement.
+            result = self.conn.execute(
+                f"SELECT * FROM ducklake_rewrite_data_files('{self.catalog_alias}',"
+                f" '{table}', delete_threshold := {delete_threshold}, schema :="
+                f" '{schema}')"
+            ).fetchone()
+            # Cas où le résultat est vide
+            if result is None:
+                # No-op réel : aucun fichier ne dépasse le seuil de suppression
+                self.logger.info(
+                    f"rewrite_data_files {schema}.{table} : 0 rewriten file"
+                    f" (deletion threshold {delete_threshold} unreached)"
+                )
+                return schema, table, 0, 0
+            # Extractions des composantes du résultat
+            schema_name, table_name, files_processed, files_created = result
             # Logging
             self.logger.info(
-                f"The rewriting of the file deletion is finished : {schema}.{table}"
+                f"rewrite_data_files {schema}.{table} : {files_processed} file(s)"
+                f" processed, {files_created} file(s) created"
+                f" (delete_threshold={delete_threshold})"
             )
+            return schema_name, table_name, files_processed, files_created
         except Exception as e:
             # Loggin
             self.logger.warning(f"rewrite_data_files failed for {schema}.{table} : {e}")
+            return schema, table, 0, 0
+
+    # Écriture en Parquet des lignes inlinées dans le catalogue
+    def flush_inlined_data(
+        self, table: str | None = None
+    ) -> list[tuple[str, str, int]]:
+        """
+        Write inlined catalog rows out to Parquet files.
+
+        Data inlining is active by default: a small
+        ``INSERT`` produces no Parquet file at all, the rows living in the catalog
+        instead. This procedure flushes them out to Parquet — required before
+        reading the data path's files directly, and recommended in planned
+        maintenance.
+
+        Args:
+            table (Optional[str]): Table to flush, in this instance's ``schema``.
+                Defaults to None, flushing every table of the whole catalog.
+
+        Returns:
+            list[tuple[str, str, int]]: ``(schema_name, table_name, rows_flushed)``
+            rows as reported by DuckLake — empty when there was nothing inlined, or
+            if the call fails (logged as a warning, non-fatal).
+
+        Examples:
+            >>> maint.flush_inlined_data()
+            >>> maint.flush_inlined_data('fact_table')
+        """
+        try:
+            if table is not None:
+                # table_name / schema_name sont des paramètres nommés uniquement.
+                query = (
+                    f"SELECT * FROM ducklake_flush_inlined_data('{self.catalog_alias}',"
+                    f" table_name := '{table}', schema_name := '{self.schema}')"
+                )
+            else:
+                # Aucune table : vidage de l'ensemble du catalogue
+                query = (
+                    f"SELECT * FROM ducklake_flush_inlined_data('{self.catalog_alias}')"
+                )
+            rows = self.conn.execute(query).fetchall()
+            total_rows = sum(r[2] for r in rows)
+            # Logging : un zéro est toujours explicité
+            if not rows:
+                self.logger.info(
+                    f"flush_inlined_data ({table or 'for all tables'}) : nothing to"
+                    f" flush (no ilined row)"
+                )
+            else:
+                self.logger.info(
+                    f"flush_inlined_data ({table or 'for all tables'}) :"
+                    f" {int(total_rows)} line(s) flushed to Parquet"
+                )
+            return rows
+        except Exception as e:
+            # Logging
+            self.logger.warning(f"flush_inlined_data failed for {table} : {e}")
+            return []
+
+    # Suppression des fichiers du data_path inconnus du catalogue
+    def delete_orphaned_files(
+        self,
+        older_than: datetime | str | None = None,
+        dry_run: bool = True,
+    ) -> list[str]:
+        """
+        Delete files under ``data_path`` that are unknown to the catalog.
+
+        Reserved for after an incident (interrupted transaction, manual file copy) —
+        run with ``dry_run=True`` first to review what would be deleted. This is an
+        **irreversible** operation, unrelated to snapshot expiration.
+
+        Args:
+            older_than (datetime | str | None): Only consider files older than this
+                cutoff. Defaults to None (no age filter).
+            dry_run (bool): When True (the default), list the files that would be
+                deleted without deleting them.
+
+        Returns:
+            list[str]: Paths deleted (or that would be deleted, under ``dry_run``).
+
+        Examples:
+            >>> maint.delete_orphaned_files()  # dry_run=True by default : safe review
+            >>> maint.delete_orphaned_files(dry_run=False)  # actually deletes
+        """
+        try:
+            # older_than n'est ajouté que s'il est fourni : le passer explicitement à
+            # NULL provoque une erreur interne DuckDB (mesuré).
+            parts = [f"dry_run := {str(dry_run).lower()}"]
+            if older_than is not None:
+                ts = (
+                    older_than
+                    if isinstance(older_than, str)
+                    else older_than.strftime("%Y-%m-%d %H:%M:%S")
+                )
+                parts.append(f"older_than := TIMESTAMPTZ '{ts}'")
+            # Construction de la requête
+            query = (
+                f"SELECT * FROM ducklake_delete_orphaned_files('{self.catalog_alias}',"
+                f" {', '.join(parts)})"
+            )
+            rows = self.conn.execute(query).fetchall()
+            paths = [r[0] for r in rows]
+            # Logging
+            mode = "dry_run" if dry_run else "supprimé(s)"
+            self.logger.info(
+                f"delete_orphaned_files : {len(paths)} file(s) ({mode})"
+            )
+            return paths
+        except Exception as e:
+            # Logging
+            self.logger.warning(f"delete_orphaned_files failed : {e}")
+            return []
 
     # Expiration des anciens snapshots du catalogue
-    def expire_snapshots(self, schema: str, older_than_days: int = 30) -> None:
+    def expire_snapshots(
+        self,
+        schema: str,
+        older_than_days: int = 30,
+        dry_run: bool = False,
+    ) -> list[tuple[Any, ...]]:
         """
         Expire old snapshots to free catalog space.
 
@@ -157,60 +392,86 @@ class DuckLakeMaintenance:
         than ``older_than_days`` as expired. Expired snapshots can no longer be
         queried via ``AT (VERSION => n)`` or ``AT (TIMESTAMP => t)``.
 
+        **Reserved for planned maintenance with an explicit retention** — never
+        called from ``DatabaseUpdater``/``DatabaseDeleter`` after a normal write,
+        since it destroys time travel beyond the retention.
+
         Args:
             schema (str): DuckLake schema name (e.g. ``'main'``).
             older_than_days (int): Snapshots older than this many days will be expired.
                 Defaults to 30.
+            dry_run (bool): When True, list the snapshots that would be expired
+                without expiring them. Defaults to False.
+
+        Returns:
+            list[tuple]: The expired (or, under ``dry_run``, would-be-expired)
+            snapshot rows, or an empty list if the call fails (logged as a warning).
 
         Examples:
             >>> maint.expire_snapshots('main', older_than_days=30)
-            >>> maint.expire_snapshots('main', older_than_days=7)
+            >>> maint.expire_snapshots('main', older_than_days=7, dry_run=True)
         """
         # Calcul du timestamp de coupure à partir du nombre de jours
         cutoff: datetime = datetime.now() - timedelta(days=older_than_days)
         cutoff_str: str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
         try:
             # Exécution de la requête
-            self.conn.execute(
-                f"CALL ducklake_expire_snapshots('{self.catalog_alias}', "
-                f"older_than := TIMESTAMPTZ '{cutoff_str}')"
-            )
+            rows = self.conn.execute(
+                f"SELECT * FROM ducklake_expire_snapshots('{self.catalog_alias}', "
+                f"older_than := TIMESTAMPTZ '{cutoff_str}',"
+                f" dry_run := {str(dry_run).lower()})"
+            ).fetchall()
             # Logging
             self.logger.info(
-                f"Snapshots before the cutoff date {cutoff_str} expiration is finished"
-                f": {schema}"
+                f"expire_snapshots {schema} (cutoff={cutoff_str}, dry_run={dry_run}) :"
+                f" {len(rows)} snapshot(s)"
             )
+            return rows
         except Exception as e:
             # Logging
             self.logger.warning(f"expire_snapshots failed for {schema} : {e}")
+            return []
 
     # Nettoyage des fichiers Parquet orphelins
-    def cleanup_files(self, schema: str) -> None:
+    def cleanup_files(self, schema: str, dry_run: bool = False) -> list[str]:
         """
-        Remove orphaned Parquet files no longer referenced by any snapshot.
+        Remove files no longer referenced by any live snapshot.
 
         After expiring snapshots, the Parquet data files they referenced remain on
-        disk until this procedure is called. It scans the catalog and deletes any
-        data files that are not referenced by a live snapshot.
+        disk until this procedure is called — the only step that actually frees disk
+        space (measured). **Reserved for planned maintenance**, after
+        ``expire_snapshots``.
 
         Args:
             schema (str): DuckLake schema name (e.g. ``'main'``).
+            dry_run (bool): When True, list the files that would be deleted without
+                deleting them. Defaults to False.
+
+        Returns:
+            list[str]: Paths deleted (or that would be deleted, under ``dry_run``),
+            or an empty list if the call fails (logged as a warning).
 
         Examples:
             >>> maint.cleanup_files('main')
+            >>> maint.cleanup_files('main', dry_run=True)
         """
         try:
             # Exécution de la suppression des fichiers orphelins
-            self.conn.execute(
-                f"CALL ducklake_cleanup_old_files('{self.catalog_alias}')"
-            )
+            rows = self.conn.execute(
+                f"SELECT * FROM ducklake_cleanup_old_files('{self.catalog_alias}',"
+                f" dry_run := {str(dry_run).lower()})"
+            ).fetchall()
+            paths = [r[0] for r in rows]
             # Logging
+            mode = "dry_run" if dry_run else "supprimé(s)"
             self.logger.info(
-                f"the cleaning of the orphaned files is finished : {schema}"
+                f"cleanup_files {schema} : {len(paths)} fichier(s) ({mode})"
             )
+            return paths
         except Exception as e:
             # Logging
             self.logger.warning(f"cleanup_files failed for {schema} : {e}")
+            return []
 
     # ---------------------------------------------------------------------------
     # Méthodes de gestion du partitionnement
@@ -370,14 +631,18 @@ class DuckLakeMaintenance:
         """
         Run all maintenance operations in the recommended order.
 
-        Executes in sequence: ``merge_files`` → ``rewrite_data_files`` →
-        ``expire_snapshots`` → ``cleanup_files``. Each step is wrapped in a
-        ``try/except`` so a failure in one step does not block the others.
+        Executes in sequence: ``flush_inlined_data`` → ``merge_files`` →
+        ``rewrite_data_files`` → ``expire_snapshots`` → ``cleanup_files``. Each step
+        is wrapped in a ``try/except`` so a failure in one step does not block the
+        others. Includes ``expire_snapshots``/``cleanup_files`` — this is planned
+        maintenance with an explicit retention, unlike the after-write compaction run
+        by ``DatabaseUpdater``/``DatabaseDeleter`` (which only run the first three,
+        safe steps).
 
         Args:
             schema (str): DuckLake schema name (e.g. ``'main'``).
-            table (str): Table name to compact (passed to ``merge_files`` and
-                ``rewrite_data_files``).
+            table (str): Table name to compact (passed to ``flush_inlined_data``,
+                ``merge_files`` and ``rewrite_data_files``).
             older_than_days (int): Passed to ``expire_snapshots``. Defaults to 30.
 
         Examples:
@@ -391,6 +656,13 @@ class DuckLakeMaintenance:
 
         # Chaque étape est enveloppée dans un try/except pour garantir que
         # l'échec d'une étape ne bloque pas les étapes suivantes.
+
+        # Étape 0 : écriture en Parquet des lignes inlinées dans le catalogue, avant
+        # toute opération de compaction portant sur les fichiers
+        try:
+            self.flush_inlined_data(table)
+        except Exception as e:
+            self.logger.warning(f"full_maintenance — flush_inlined_data failed : {e}")
 
         # Étape 1 : fusion des petits fichiers Parquet adjacents
         try:

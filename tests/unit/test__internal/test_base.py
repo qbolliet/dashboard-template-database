@@ -433,9 +433,7 @@ def test_catalog_alias_default_and_custom(
     assert default_mgr.catalog_alias == "db"
 
     # Valeur explicite propagée jusqu'à la classe de base
-    custom_mgr = DataManager(
-        connection=built_ducklake_schema, catalog_alias="my_lake"
-    )
+    custom_mgr = DataManager(connection=built_ducklake_schema, catalog_alias="my_lake")
     assert custom_mgr.catalog_alias == "my_lake"
 
 
@@ -453,9 +451,7 @@ def test_table_exists_isolated_by_schema(
         multi_schema_connection: Connection with 'predictions' and 'shapley' schemas.
     """
     # Gestionnaires liés à chacun des deux schémas construits
-    pred_mgr = DataManager(
-        connection=multi_schema_connection, schema="predictions"
-    )
+    pred_mgr = DataManager(connection=multi_schema_connection, schema="predictions")
     shap_mgr = DataManager(connection=multi_schema_connection, schema="shapley")
 
     # Chaque schéma voit bien ses propres tables
@@ -478,9 +474,7 @@ def test_metadata_isolated_by_schema(
     Args:
         multi_schema_connection: Connection with 'predictions' and 'shapley' schemas.
     """
-    pred_mgr = DataManager(
-        connection=multi_schema_connection, schema="predictions"
-    )
+    pred_mgr = DataManager(connection=multi_schema_connection, schema="predictions")
     shap_mgr = DataManager(connection=multi_schema_connection, schema="shapley")
 
     pred_columns = set(pred_mgr._load_current_metadata()["name"].to_list())
@@ -648,8 +642,7 @@ def test_update_column_metadata_parent_name_forces_categorical(
     assert row == ("date", True, True)
 
     parent_row = manager.conn.execute(
-        "SELECT is_categorical, is_categorical_forced"
-        " FROM metadata WHERE name = 'date'"
+        "SELECT is_categorical, is_categorical_forced FROM metadata WHERE name = 'date'"
     ).fetchone()
     assert parent_row == (True, True)
 
@@ -745,3 +738,72 @@ def test_clear_child_parent_references_no_children(manager: DataManager) -> None
     """
     detached = manager._clear_child_parent_references("value")
     assert detached == []
+
+
+# ===========================================================================
+# Tests de _get_cluster_by_columns() et update_cluster_by() (§5.3)
+# ===========================================================================
+
+
+# Test que _get_cluster_by_columns lit la valeur par défaut (clé primaire)
+def test_get_cluster_by_columns_reads_default(manager: DataManager) -> None:
+    """Test that _get_cluster_by_columns reads the primary-key default.
+
+    Args:
+        manager: DataManager fixture with a built schema (primary_keys=['id']).
+    """
+    # built_ducklake_schema est construit sans cluster_by explicite : défaut = ['id']
+    assert manager._get_cluster_by_columns() == ["id"]
+
+
+# Test que _get_cluster_by_columns retourne None si dataset_metadata est absente
+def test_get_cluster_by_columns_missing_table_returns_none() -> None:
+    """Test that _get_cluster_by_columns returns None without dataset_metadata."""
+    manager = DataManager(connection=duckdb.connect(":memory:"))
+    assert manager._get_cluster_by_columns() is None
+
+
+# Test que update_cluster_by persiste la nouvelle valeur
+def test_update_cluster_by_persists_value(manager: DataManager) -> None:
+    """Test that update_cluster_by writes the new column list as JSON.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    manager.update_cluster_by(["category", "id"])
+    assert manager._get_cluster_by_columns() == ["category", "id"]
+
+
+# Test que update_cluster_by ne modifie pas les données de fact_table
+def test_update_cluster_by_does_not_rewrite_data(manager: DataManager) -> None:
+    """Test that update_cluster_by is a metadata-only change.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    before = manager.conn.execute("SELECT * FROM fact_table ORDER BY id").fetchall()
+    manager.update_cluster_by(["category"])
+    after = manager.conn.execute("SELECT * FROM fact_table ORDER BY id").fetchall()
+    assert before == after
+
+
+# Test que update_cluster_by rejette une liste vide
+def test_update_cluster_by_empty_raises(manager: DataManager) -> None:
+    """Test that update_cluster_by raises ValueError on an empty column list.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    with pytest.raises(ValueError, match="columns must not be empty"):
+        manager.update_cluster_by([])
+
+
+# Test que update_cluster_by rejette une colonne absente de fact_table
+def test_update_cluster_by_unknown_column_raises(manager: DataManager) -> None:
+    """Test that update_cluster_by raises ValueError on an unknown column.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    with pytest.raises(ValueError, match="cluster_by columns"):
+        manager.update_cluster_by(["not_a_column"])

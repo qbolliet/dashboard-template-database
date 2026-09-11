@@ -3,6 +3,7 @@
 import os
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 # DuckDB
 import duckdb
@@ -15,6 +16,17 @@ from ..utils.logger import _init_logger
 
 # Nom du logger de ce module (fichier par défaut : <cwd>/logs/ducklake_connector.log)
 _LOGGER_NAME = "ducklake_connector"
+
+# Options DuckLake recommandées : compression zstd, format Parquet v2, taille cible de fichier (unité obligatoire), taille de
+# row group alignée sur des lots de quelques dizaines de milliers de lignes.
+# `data_inlining_row_limit` est volontairement exclu : c'est un argument dédié du
+# connecteur (option d'ATTACH), pas une option de post-attachement.
+RECOMMENDED_DUCKLAKE_OPTIONS: dict[str, str | int] = {
+    "parquet_compression": "zstd",
+    "parquet_version": 2,
+    "target_file_size": "100MB",
+    "parquet_row_group_size": 122880,
+}
 
 
 # Énumération des backends de catalogue supportés par DuckLake
@@ -144,6 +156,8 @@ class DuckLakeConnector:
         s3_access_key_id: str | None = None,
         s3_secret_access_key: str | None = None,
         s3_session_token: str | None = None,
+        ducklake_options: dict[str, str | int] | Literal["recommended"] | None = None,
+        data_inlining_row_limit: int | None = None,
         log_filename: str | os.PathLike[str] | None = None,
     ) -> None:
         """
@@ -233,6 +247,19 @@ class DuckLakeConnector:
                 secret when ``None``, which is correct for long-lived IAM
                 credentials but will fail against temporary credentials that
                 require it. Defaults to None.
+            ducklake_options (dict[str, str | int] | Literal['recommended'] | None):
+                DuckLake options applied after ``ATTACH`` via
+                ``CALL <alias>.set_option(name, value)``.
+                Pass ``'recommended'`` to apply :data:`RECOMMENDED_DUCKLAKE_OPTIONS`
+                (``zstd`` compression, Parquet v2, ``'100MB'`` target file size,
+                122 880-row row groups), or a custom dict of option name to value.
+                Never applied on a read-only connection. Defaults to None (engine
+                defaults).
+            data_inlining_row_limit (Optional[int]): ``DATA_INLINING_ROW_LIMIT``
+                ATTACH option controlling data inlining (small writes kept in the
+                catalog instead of a Parquet file until flushed). ``0`` disables
+                inlining entirely — useful for tests that inspect files directly.
+                Defaults to None (engine default: inlining enabled).
             log_filename (Optional[os.PathLike]): Path to the log file.
 
         Examples:
@@ -261,6 +288,11 @@ class DuckLakeConnector:
         self.snapshot_time = snapshot_time
         self.catalog_alias = catalog_alias
         self.schema = schema
+
+        # Options DuckLake appliquées après ATTACH (set_option) et limite d'inlining
+        # appliquée comme option d'ATTACH (DATA_INLINING_ROW_LIMIT).
+        self.ducklake_options = ducklake_options
+        self.data_inlining_row_limit = data_inlining_row_limit
 
         # Détection d'un usage de S3 : sur data_path (fichiers Parquet) et/ou
         # sur catalog_path (catalogue DuckLake lui-même, backend DUCKDB
@@ -377,6 +409,9 @@ class DuckLakeConnector:
         # Création éventuelle puis activation du schéma cible
         self._activate_schema(conn)
 
+        # Application des options DuckLake configurées (aucune si read_only)
+        self._apply_ducklake_options(conn)
+
         return conn
 
     # ---------------------------------------------------------------------------
@@ -478,6 +513,10 @@ class DuckLakeConnector:
         # catalogue courant de la connexion.
         if activate_schema:
             self._activate_schema(conn)
+
+        # Application des options DuckLake configurées (aucune si read_only)
+        self._apply_ducklake_options(conn)
+
         self.logger.info(
             f"DuckLake catalog attached to the existing connection:"
             f"'{self.catalog_path}'"
@@ -1001,6 +1040,38 @@ class DuckLakeConnector:
         params_str = ", ".join(params)
         return f"CREATE OR REPLACE SECRET {secret_name} ({params_str})"
 
+    # Application des options DuckLake configurées (set_option, post-ATTACH)
+    def _apply_ducklake_options(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """
+        Apply ``ducklake_options`` to the attached catalog via ``set_option``.
+
+        No-op on a read-only connection or when ``ducklake_options`` is None. Each option
+        actually applied is logged individually.
+
+        Args:
+            conn (duckdb.DuckDBPyConnection): Connection with the catalog attached.
+        """
+        # Aucune option sur une connexion en lecture seule
+        if self.read_only or self.ducklake_options is None:
+            return
+
+        # Résolution du raccourci "recommended"
+        options = (
+            RECOMMENDED_DUCKLAKE_OPTIONS
+            if self.ducklake_options == "recommended"
+            else self.ducklake_options
+        )
+
+        # Application de chaque option, une à une
+        for name, value in options.items():
+            # Entier nu, chaîne entre guillemets sinon (échappement des apostrophes)
+            literal = (
+                value if isinstance(value, int) else f"'{_quote_literal(str(value))}'"
+            )
+            conn.execute(f"CALL {self.catalog_alias}.set_option('{name}', {literal})")
+            # Logging
+            self.logger.info(f"DuckLake option set: {name} = {value}")
+
     # Création éventuelle puis activation du schéma cible
     def _activate_schema(self, conn: duckdb.DuckDBPyConnection) -> None:
         """
@@ -1063,12 +1134,18 @@ class DuckLakeConnector:
           (PostgreSQL backend).
         - ``READ_ONLY`` is appended for read-only or time-travel connections.
         - ``SNAPSHOT_VERSION`` or ``SNAPSHOT_TIME`` is appended for time travel.
+        - ``DATA_INLINING_ROW_LIMIT`` is appended when configured (plain integer,
+          no unit/quotes).
 
         Returns:
             str: The complete ``ATTACH`` SQL statement.
         """
         # Liste des options ATTACH à construire
         options = [f"DATA_PATH '{self.data_path}'"]
+
+        # Limite d'inlining : entier nu (mesuré), pas de guillemets
+        if self.data_inlining_row_limit is not None:
+            options.append(f"DATA_INLINING_ROW_LIMIT {self.data_inlining_row_limit}")
 
         # Référence au secret d'identifiants du catalogue (backend PostgreSQL)
         if self.meta_secret is not None:

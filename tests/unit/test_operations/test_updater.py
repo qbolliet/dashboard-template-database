@@ -1,13 +1,32 @@
 # Importation des modules
 # Modules de base
+import os
+import warnings
 from datetime import datetime
 from typing import Any
 
+import duckdb
 import polars as pl
 
 # Module de tests
+import pytest
+
 # Modules du package à tester
+from dt_ducklake_manager.connection import DuckLakeConnector
 from dt_ducklake_manager.operations import DatabaseUpdater
+from dt_ducklake_manager.schema import DuckLakeTablesBuilder
+
+
+def _ducklake_available() -> bool:
+    """Vérifie si l'extension DuckLake est disponible dans l'environnement de test."""
+    try:
+        conn = duckdb.connect(":memory:")
+        conn.execute("INSTALL ducklake; LOAD ducklake;")
+        conn.close()
+        return True
+    except Exception:
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Tests de l'initialisation
@@ -453,9 +472,7 @@ def test_update_stamps_dataset_metadata(
     )
 
     assert (
-        updater.update_database(
-            update_df=new_rows, keep="first", use_transaction=False
-        )
+        updater.update_database(update_df=new_rows, keep="first", use_transaction=False)
         is True
     )
 
@@ -505,3 +522,61 @@ def test_update_database_preserves_ui_metadata(
         " FROM metadata WHERE name = 'value'"
     ).fetchone()
     assert row == ("€", ",.2f", "kpi", "the value", "SUM")
+
+
+# ---------------------------------------------------------------------------
+# Test de bout en bout de la compaction DuckLake après update (§5.4-5.5)
+# ---------------------------------------------------------------------------
+
+
+# Test que update_database réussit avec compaction réelle sur un catalogue sur disque
+@pytest.mark.skipif(
+    not _ducklake_available(),
+    reason="Extension ducklake non disponible dans cet environnement",
+)
+def test_update_database_compacts_on_real_ducklake_catalog(tmp_path: Any) -> None:
+    """Test that update_database succeeds end-to-end against a real DuckLake catalog.
+
+    The in-memory ``built_ducklake_schema`` fixture used elsewhere in this file
+    can't exercise ``_run_ducklake_compaction`` for real: DuckLake table functions
+    need an actually attached catalog. This test attaches a real one and checks
+    that ``update_database`` (with ``compact_after_update=True``, the default)
+    still returns True and the new rows land — i.e. the ``DuckLakeMaintenance``
+    wiring in ``_run_ducklake_compaction`` doesn't break the write path.
+
+    Args:
+        tmp_path: pytest temporary directory.
+    """
+    catalog = str(tmp_path / "test.ducklake")
+    data_dir = str(tmp_path / "data")
+    os.makedirs(data_dir)
+    conn = DuckLakeConnector(catalog, data_dir, data_inlining_row_limit=0).connect()
+
+    df = pl.DataFrame(
+        {
+            "id": list(range(1, 6)),
+            "category": ["A", "B", "A", "C", "B"],
+            "value": [0.1, 0.2, 0.3, 0.4, 0.5],
+        }
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        DuckLakeTablesBuilder(
+            df, categorical_threshold=4, primary_keys=["id"], connection=conn
+        ).build_schema()
+
+    updater = DatabaseUpdater(connection=conn, categorical_threshold=4)
+    update_df = pl.DataFrame(
+        {"id": [10, 11], "category": ["A", "C"], "value": [1.1, 2.2]}
+    )
+
+    assert (
+        updater.update_database(
+            update_df=update_df, keep="first", use_transaction=False
+        )
+        is True
+    )
+
+    row_count = conn.execute("SELECT COUNT(*) FROM fact_table").fetchone()[0]
+    assert row_count == 7
+    conn.close()

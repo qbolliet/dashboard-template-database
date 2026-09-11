@@ -1,9 +1,33 @@
 # Importation des modules
+# Modules de base
+import os
+import warnings
+
 # Module de tests
 from typing import Any
 
+import duckdb
+import polars as pl
+
+# Module de tests
+import pytest
+
 # Modules du package à tester
+from dt_ducklake_manager.connection import DuckLakeConnector
 from dt_ducklake_manager.operations import DatabaseDeleter
+from dt_ducklake_manager.schema import DuckLakeTablesBuilder
+
+
+def _ducklake_available() -> bool:
+    """Vérifie si l'extension DuckLake est disponible dans l'environnement de test."""
+    try:
+        conn = duckdb.connect(":memory:")
+        conn.execute("INSTALL ducklake; LOAD ducklake;")
+        conn.close()
+        return True
+    except Exception:
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Tests de l'initialisation
@@ -44,9 +68,7 @@ def test_deleter_propagates_catalog_alias(built_ducklake_schema: Any) -> None:
         built_ducklake_schema: Fixture providing a DuckDB connection with a built
         schema.
     """
-    deleter = DatabaseDeleter(
-        connection=built_ducklake_schema, catalog_alias="my_lake"
-    )
+    deleter = DatabaseDeleter(connection=built_ducklake_schema, catalog_alias="my_lake")
     assert deleter.catalog_alias == "my_lake"
     assert deleter.data_mgr.catalog_alias == "my_lake"
     assert deleter.transaction_mgr.catalog_alias == "my_lake"
@@ -312,9 +334,7 @@ def test_delete_columns_parent_with_cascade_detaches_children(
     # 'category' et 'status' sont déjà catégorielles (seuil=4) : aucun forçage
     deleter.update_column_metadata("category", parent_name="status")
 
-    result = deleter.delete_columns(
-        ["status"], use_transaction=False, cascade=True
-    )
+    result = deleter.delete_columns(["status"], use_transaction=False, cascade=True)
 
     assert result == {"status": True}
     columns_after = [
@@ -328,3 +348,50 @@ def test_delete_columns_parent_with_cascade_detaches_children(
         "SELECT parent_name FROM metadata WHERE name = 'category'"
     ).fetchone()[0]
     assert parent_of_category is None
+
+
+# ---------------------------------------------------------------------------
+# Test de bout en bout de la compaction DuckLake après delete (§5.4-5.5)
+# ---------------------------------------------------------------------------
+
+
+# Test que delete_rows réussit avec compaction réelle sur un catalogue sur disque
+@pytest.mark.skipif(
+    not _ducklake_available(),
+    reason="Extension ducklake non disponible dans cet environnement",
+)
+def test_delete_rows_compacts_on_real_ducklake_catalog(tmp_path: Any) -> None:
+    """Test that delete_rows succeeds end-to-end against a real DuckLake catalog.
+
+    Mirrors ``test_update_database_compacts_on_real_ducklake_catalog``: the
+    in-memory fixture used elsewhere in this file can't exercise
+    ``_run_ducklake_compaction`` for real.
+
+    Args:
+        tmp_path: pytest temporary directory.
+    """
+    catalog = str(tmp_path / "test.ducklake")
+    data_dir = str(tmp_path / "data")
+    os.makedirs(data_dir)
+    conn = DuckLakeConnector(catalog, data_dir, data_inlining_row_limit=0).connect()
+
+    df = pl.DataFrame(
+        {
+            "id": list(range(1, 6)),
+            "category": ["A", "B", "A", "C", "B"],
+            "value": [0.1, 0.2, 0.3, 0.4, 0.5],
+        }
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        DuckLakeTablesBuilder(
+            df, categorical_threshold=4, primary_keys=["id"], connection=conn
+        ).build_schema()
+
+    deleter = DatabaseDeleter(connection=conn, categorical_threshold=4)
+    deleted = deleter.delete_rows(filters=[("id", "=", 1)], use_transaction=False)
+
+    assert deleted == 1
+    row_count = conn.execute("SELECT COUNT(*) FROM fact_table").fetchone()[0]
+    assert row_count == 4
+    conn.close()

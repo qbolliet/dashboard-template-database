@@ -52,14 +52,15 @@ def test_full_schema_build_from_local_data(sample_df: pl.DataFrame) -> None:
     ]
     assert categories == ["A", "B", "C"]
 
-    # Vérification de la ligne unique de dataset_metadata
+    # Vérification de la ligne unique de dataset_metadata.
+    # cluster_by défaut aux clés primaires en l'absence de valeur explicite (§5.3).
     dataset_row = builder.conn.execute(
         "SELECT schema_version, updated_at, cluster_by FROM dataset_metadata"
     ).fetchall()
     assert len(dataset_row) == 1
     assert dataset_row[0][0] == 1
     assert dataset_row[0][1] is not None
-    assert dataset_row[0][2] is None
+    assert dataset_row[0][2] == '["id"]'
 
     # Vérification que la fact table contient le bon nombre de lignes
     row_count_row = builder.conn.execute("SELECT COUNT(*) FROM fact_table").fetchone()

@@ -318,6 +318,130 @@ def test_build_attach_sql_snapshot_time(ducklake_paths: tuple[str, str]) -> None
     assert "SNAPSHOT_TIME '2025-01-01 00:00:00'" in sql
 
 
+# Test de la construction de la clause ATTACH avec DATA_INLINING_ROW_LIMIT
+def test_build_attach_sql_data_inlining_row_limit(
+    ducklake_paths: tuple[str, str],
+) -> None:
+    """Test that data_inlining_row_limit adds a bare-integer ATTACH option.
+
+    Args:
+        ducklake_paths: Fixture providing (catalog_path, data_path).
+    """
+    catalog, data_dir = ducklake_paths
+    connector = DuckLakeConnector(catalog, data_dir, data_inlining_row_limit=0)
+    sql = connector._build_attach_sql()
+    assert "DATA_INLINING_ROW_LIMIT 0" in sql
+
+
+# Test que data_inlining_row_limit est absent par défaut
+def test_build_attach_sql_no_data_inlining_row_limit_by_default(
+    ducklake_paths: tuple[str, str],
+) -> None:
+    """Test that DATA_INLINING_ROW_LIMIT is omitted when not configured.
+
+    Args:
+        ducklake_paths: Fixture providing (catalog_path, data_path).
+    """
+    catalog, data_dir = ducklake_paths
+    connector = DuckLakeConnector(catalog, data_dir)
+    sql = connector._build_attach_sql()
+    assert "DATA_INLINING_ROW_LIMIT" not in sql
+
+
+# ---------------------------------------------------------------------------
+# Tests des options DuckLake (ducklake_options, §5.4)
+# ---------------------------------------------------------------------------
+
+
+# Test que ducklake_options='recommended' positionne les options recommandées
+def test_ducklake_options_recommended(ducklake_paths: tuple[str, str]) -> None:
+    """Test that 'recommended' applies RECOMMENDED_DUCKLAKE_OPTIONS after connect.
+
+    Args:
+        ducklake_paths: Fixture providing (catalog_path, data_path).
+    """
+    catalog, data_dir = ducklake_paths
+    conn = DuckLakeConnector(
+        catalog, data_dir, ducklake_options="recommended"
+    ).connect()
+
+    options = dict(
+        conn.execute("SELECT option_name, value FROM ducklake_options('db')").fetchall()
+    )
+    assert options["parquet_compression"] == "zstd"
+    assert options["target_file_size"] == "100000000"
+    assert options["parquet_row_group_size"] == "122880"
+    conn.close()
+
+
+# Test qu'un dictionnaire explicite d'options est appliqué
+def test_ducklake_options_explicit_dict(ducklake_paths: tuple[str, str]) -> None:
+    """Test that an explicit ducklake_options dict is applied after connect.
+
+    Args:
+        ducklake_paths: Fixture providing (catalog_path, data_path).
+    """
+    catalog, data_dir = ducklake_paths
+    conn = DuckLakeConnector(
+        catalog, data_dir, ducklake_options={"parquet_compression": "gzip"}
+    ).connect()
+
+    options = dict(
+        conn.execute("SELECT option_name, value FROM ducklake_options('db')").fetchall()
+    )
+    assert options["parquet_compression"] == "gzip"
+    conn.close()
+
+
+# Test qu'aucune option n'est appliquée sur une connexion en lecture seule
+def test_ducklake_options_not_applied_on_read_only(
+    ducklake_paths: tuple[str, str],
+) -> None:
+    """Test that ducklake_options is never applied on a read-only connection.
+
+    Args:
+        ducklake_paths: Fixture providing (catalog_path, data_path).
+    """
+    catalog, data_dir = ducklake_paths
+    # Création initiale (lecture-écriture, sans options particulières)
+    DuckLakeConnector(catalog, data_dir).connect().close()
+
+    # Réouverture en lecture seule avec des options demandées : ne doivent pas être
+    # appliquées (set_option échouerait de toute façon sur une connexion read-only)
+    ro_conn = DuckLakeConnector(
+        catalog, data_dir, read_only=True, ducklake_options="recommended"
+    ).connect()
+    options = dict(
+        ro_conn.execute(
+            "SELECT option_name, value FROM ducklake_options('db')"
+        ).fetchall()
+    )
+    assert "parquet_compression" not in options
+    ro_conn.close()
+
+
+# Test que data_inlining_row_limit=0 désactive effectivement l'inlining
+def test_data_inlining_row_limit_zero_disables_inlining(
+    ducklake_paths: tuple[str, str],
+) -> None:
+    """Test that data_inlining_row_limit=0 makes a small insert produce a file.
+
+    Args:
+        ducklake_paths: Fixture providing (catalog_path, data_path).
+    """
+    catalog, data_dir = ducklake_paths
+    conn = DuckLakeConnector(catalog, data_dir, data_inlining_row_limit=0).connect()
+    conn.execute("CREATE TABLE t (a INTEGER)")
+    conn.execute("INSERT INTO t VALUES (1), (2)")
+
+    file_count = conn.execute(
+        "SELECT file_count FROM ducklake_table_info('db') WHERE table_name = 't'"
+    ).fetchone()[0]
+    # Sans inlining, même un petit INSERT produit immédiatement un fichier Parquet
+    assert file_count == 1
+    conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Tests du backend PostgreSQL (construction, sans serveur Postgres requis)
 # ---------------------------------------------------------------------------
