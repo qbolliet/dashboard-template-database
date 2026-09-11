@@ -396,6 +396,44 @@ class BaseSchemaManager(ABC):
         # Logging
         self.logger.info(f"Updated cluster_by to {columns}")
 
+    # Méthode de retrait d'une colonne supprimée du tri physique (cluster_by)
+    def _remove_from_cluster_by(self, column: str) -> None:
+        """
+        Remove ``column`` from ``dataset_metadata.cluster_by`` if it is part of it.
+
+        Called after a column has been dropped from the fact table
+        (``DatabaseDeleter.delete_columns``): a ``cluster_by`` referencing a column
+        that no longer exists would break every future sorted write. When the
+        removal empties the list, ``cluster_by`` is reset to ``NULL`` (no known
+        sort key) rather than an empty JSON array.
+
+        Args:
+            column: Name of the column that was just dropped.
+
+        Example:
+            >>> manager._remove_from_cluster_by('region')
+        """
+        # Valeur courante (None si non définie ou table absente)
+        cluster_by = self._get_cluster_by_columns()
+        if not cluster_by or column not in cluster_by:
+            return
+
+        # Retrait de la colonne, écriture directe (la colonne n'existe déjà plus
+        # dans la table des faits : update_cluster_by refuserait la validation
+        # d'existence)
+        remaining = [c for c in cluster_by if c != column]
+        new_value = json.dumps(remaining) if remaining else None
+        self.conn.execute(
+            f"UPDATE {self._qualified('dataset_metadata')} SET cluster_by = ?",
+            [new_value],
+        )
+
+        # Logging
+        self.logger.warning(
+            f"Column {column!r} removed from cluster_by (was {cluster_by}); "
+            f"physical sort key is now {remaining or None}"
+        )
+
     # Méthodes de gestion des métadonnées
     # Méthode d'ajout d'une colonne aux méta-données
     def _add_column_to_metadata(

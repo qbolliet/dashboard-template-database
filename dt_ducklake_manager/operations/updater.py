@@ -23,6 +23,7 @@ from ..utils.sql import (
     quote_ident,
     remove_dataframe_duplicates,
 )
+from ..utils.types import map_python_to_sql_type, validate_column_metadata
 
 # Emplacement du fichier
 FILE_PATH = Path(os.path.abspath(__file__))
@@ -186,6 +187,8 @@ class DatabaseUpdater(BaseSchemaManager):
         use_batch_processing: bool = True,
         use_transaction: bool = True,
         compact_after_update: bool = True,
+        allow_new_columns: bool = False,
+        column_metadata: dict[str, dict[str, str]] | None = None,
     ) -> bool:
         """
         Update the entire database with new data using atomic operations.
@@ -200,14 +203,32 @@ class DatabaseUpdater(BaseSchemaManager):
             compact_after_update: Whether to run DuckLake compaction (merge small delta
                 files and rewrite delete files) immediately after a successful update.
                 Adds write latency but keeps read performance optimal. Defaults to True.
+            allow_new_columns: Whether a column of ``update_df`` absent from the
+                fact table may be added. Defaults to False: an unknown column then
+                raises ``ValueError`` instead of being silently added. When True,
+                each new column is added (SQL type via ``map_python_to_sql_type``),
+                given a ``metadata`` row (``is_primary_key=False``, ``is_categorical``
+                inferred), and its UI fields are taken from ``column_metadata``.
+            column_metadata: Per-new-column UI fields (``label``, ``unit``,
+                ``display_format``, ``family``, ``description``,
+                ``default_aggregation``, ``parent_name``), applied only when
+                ``allow_new_columns`` is True. Ignored for columns that already
+                exist in the fact table.
 
         Returns:
             True if update was successful, False otherwise
+
+        Raises:
+            ValueError: If ``update_df`` carries a column absent from the fact
+                table and ``allow_new_columns`` is False.
 
         Examples:
             >>> success = updater.update_database(new_data_df)
             >>> success = updater.update_database(new_data_df,
             compact_after_update=True)
+            >>> success = updater.update_database(
+            ...     new_data_df, allow_new_columns=True,
+            ...     column_metadata={'score': {'unit': '%'}})
         """
         # Conversion vers narwhals dès le point d'entrée public
         update_df = nw.from_native(update_df, eager_only=True)
@@ -228,6 +249,21 @@ class DatabaseUpdater(BaseSchemaManager):
                 "The update procedure requires a primary key."
             )
             return False
+
+        # Colonnes du DataFrame absentes de la fact_table : refusées par défaut.
+        # L'ajout implicite silencieux (DataManager._ensure_columns_exist)
+        # n'est plus jamais atteint depuis cette méthode publique puisque les
+        # colonnes manquantes sont ajoutées explicitement ci-dessous avant que
+        # l'insertion/upsert ne s'exécute.
+        existing_columns = set(self._get_fact_table_columns())
+        new_columns = [c for c in update_df.columns if c not in existing_columns]
+        if new_columns:
+            if not allow_new_columns:
+                raise ValueError(
+                    f"Unknown column(s) in update_df: {sorted(new_columns)}. Pass "
+                    "allow_new_columns=True to add them explicitly."
+                )
+            self._add_new_columns_from_update(update_df, new_columns, column_metadata)
 
         # Logging
         self.logger.info(
@@ -255,6 +291,54 @@ class DatabaseUpdater(BaseSchemaManager):
                 use_batch_processing,
                 compact_after_update,
             )
+
+    # Méthode auxiliaire d'ajout explicite des colonnes inconnues d'un update_df
+    def _add_new_columns_from_update(
+        self,
+        update_df: nw.DataFrame[Any],
+        new_columns: list[str],
+        column_metadata: dict[str, dict[str, str]] | None,
+    ) -> None:
+        """Add columns of ``update_df`` absent from the fact table, with metadata.
+
+        Called by ``update_database`` when ``allow_new_columns=True``. Each column
+        is added via ``ALTER TABLE ... ADD COLUMN`` (type from
+        ``map_python_to_sql_type``), given a ``metadata`` row
+        (``is_primary_key=False``, ``is_categorical`` inferred from the batch), and
+        its UI fields (if any, in ``column_metadata``) are applied. Runs before the
+        insert/upsert step, so the columns already exist by the time it executes.
+
+        Args:
+            update_df: The full update DataFrame (narwhals).
+            new_columns: Columns of ``update_df`` absent from the fact table.
+            column_metadata: Per-column UI fields, validated against
+                ``new_columns``.
+
+        Raises:
+            ValueError: If ``column_metadata`` references a column outside
+                ``new_columns`` or carries an unknown/invalid field.
+        """
+        # Validation du dictionnaire de métadonnées d'UI, restreint aux colonnes
+        # effectivement nouvelles
+        normalized_metadata = validate_column_metadata(column_metadata, new_columns)
+
+        # Parcours des colonnes
+        for column in new_columns:
+            # Ajout de la colonne à la fact table
+            sql_type = map_python_to_sql_type(update_df.schema[column])
+            self.conn.execute(
+                f"ALTER TABLE {self._qualified('fact_table')} ADD COLUMN"
+                f" {quote_ident(column)} {sql_type} DEFAULT NULL"
+            )
+            # Ligne de méta-données (is_primary_key=FALSE, is_categorical inféré)
+            self._add_column_to_metadata(column, update_df)
+            # Champs d'UI éventuels
+            fields = normalized_metadata.get(column)
+            if fields:
+                self.update_column_metadata(column, **fields)
+
+        # Logging
+        self.logger.info(f"Added new column(s) from update_df: {new_columns}")
 
     # Méthode de mise à jour de la base de données de manière transactionnelle
     def _update_database_transactional(
@@ -1029,6 +1113,286 @@ class DatabaseUpdater(BaseSchemaManager):
 
         except Exception as e:
             self.logger.error(f"Error cleaning orphaned data: {e}")
+
+    # ---------------------------------------------------------------------------
+    # Gestion explicite des colonnes : ajout de colonnes de valeurs
+    # ---------------------------------------------------------------------------
+
+    # Méthode d'ajout explicite de colonnes de valeurs à partir d'un DataFrame
+    def add_columns(
+        self,
+        df: IntoDataFrame,
+        column_metadata: dict[str, dict[str, str]] | None = None,
+        overwrite: bool = False,
+        compact_after_update: bool = True,
+    ) -> bool:
+        """
+        Add value column(s) to the fact table from a DataFrame keyed by the
+        primary keys.
+
+        ``df`` must carry every primary key column (to identify which existing
+        rows receive a value) plus one or more other columns, the values to add.
+        This is **not** an upsert: no row is inserted, and a combination of primary
+        keys present in ``df`` but absent from the fact table is skipped with a
+        warning.
+
+        Implemented as ``ALTER TABLE ... ADD COLUMN`` for every genuinely new
+        column, followed by a **single** ``UPDATE fact_table ... FROM <df> WHERE
+        <primary keys match>`` covering all of them, inside one DuckDB transaction:
+        on any failure, neither the column(s) nor their ``metadata`` row(s)
+        survive. An ``UPDATE`` that touches every row of the fact table is a
+        complete copy-on-write rewrite; the row count about to be touched is
+        logged before it runs, and ``rewrite_data_files`` is called afterwards with
+        a low ``delete_threshold`` to clear the resulting delete-tombstones.
+
+        Args:
+            df: DataFrame carrying every primary key column plus the value
+                column(s) to add. Must be unique on the primary keys.
+            column_metadata: Per-added-column UI fields (``label``, ``unit``,
+                ``display_format``, ``family``, ``description``,
+                ``default_aggregation``, ``parent_name``). Applies to newly added
+                columns as well as to overwritten existing ones.
+            overwrite: Whether a column of ``df`` that already exists in the fact
+                table may have its values replaced. Defaults to False: an existing
+                column then raises ``ValueError`` instead.
+            compact_after_update: Whether to run DuckLake compaction
+                (``rewrite_data_files`` with a low ``delete_threshold``) after a
+                successful commit. Defaults to True.
+
+        Returns:
+            bool: True on success.
+
+        Raises:
+            ValueError: If no primary key is defined on the fact table, if ``df``
+                is missing a primary key column, if ``df`` is not unique on the
+                primary keys, if ``df`` carries no value column, if a value column
+                already exists and ``overwrite`` is False, or if ``column_metadata``
+                is malformed.
+
+        Examples:
+            >>> updater.add_columns(df_with_score)
+            >>> updater.add_columns(df_with_score, overwrite=True)
+            >>> # Diffusion explicite d'une valeur portée par une clé partielle :
+            >>> keys = updater.get_key_combinations(['region', 'produit'])
+            >>> df_partial = keys.join(df_score, on=['region', 'produit'])
+            >>> updater.add_columns(df_partial)
+        """
+        # Conversion vers narwhals dès le point d'entrée public
+        df_nw = nw.from_native(df, eager_only=True)
+
+        # Une clé primaire est requise pour cibler les lignes existantes
+        primary_keys = self._get_primary_key_columns()
+        if not primary_keys:
+            raise ValueError(
+                "No primary key is defined on the fact_table; add_columns requires"
+                " one to match rows."
+            )
+
+        # df doit porter toutes les clés primaires
+        missing_keys = [k for k in primary_keys if k not in df_nw.columns]
+        if missing_keys:
+            raise ValueError(
+                f"df is missing primary key column(s): {sorted(missing_keys)}"
+            )
+
+        # df doit être unique sur les clés primaires : sinon la valeur affectée à
+        # une même ligne de la fact table serait indéterminée (dernière ligne du
+        # lot gagnante, silencieusement)
+        if len(df_nw) != len(df_nw.unique(subset=primary_keys, keep="any")):
+            raise ValueError(f"df must be unique on primary key(s) {primary_keys}")
+
+        # Colonnes à ajouter : tout ce qui n'est pas une clé primaire
+        new_columns = [c for c in df_nw.columns if c not in primary_keys]
+        if not new_columns:
+            raise ValueError(
+                "df carries no value column to add besides the primary keys"
+            )
+
+        # Colonnes déjà existantes dans la fact table : erreur sauf overwrite=True
+        existing_columns = set(self._get_fact_table_columns())
+        already_existing = [c for c in new_columns if c in existing_columns]
+        if already_existing and not overwrite:
+            raise ValueError(
+                f"Column(s) already exist in fact_table: {sorted(already_existing)}."
+                " Pass overwrite=True to update their values instead."
+            )
+        columns_to_add = [c for c in new_columns if c not in already_existing]
+
+        # Validation des métadonnées d'UI, restreintes aux colonnes concernées
+        normalized_metadata = validate_column_metadata(column_metadata, new_columns)
+
+        fact_table = self._qualified("fact_table")
+        view_name = "_add_columns_src"
+
+        # Transaction DuckDB unique : sur échec, ni les colonnes ni les lignes
+        # metadata ne subsistent (ALTER TABLE est transactionnel dans DuckDB).
+        self.conn.begin()
+        try:
+            # ALTER TABLE ... ADD COLUMN pour chaque colonne réellement nouvelle
+            for column in columns_to_add:
+                sql_type = map_python_to_sql_type(df_nw.schema[column])
+                self.conn.execute(
+                    f"ALTER TABLE {fact_table} ADD COLUMN {quote_ident(column)}"
+                    f" {sql_type} DEFAULT NULL"
+                )
+                # Ligne de méta-données (is_primary_key=FALSE, is_categorical
+                # inféré du DataFrame)
+                self._add_column_to_metadata(column, df_nw)
+
+            # Champs d'UI (nouvelles colonnes et colonnes overwrite confondues)
+            for column in new_columns:
+                fields = normalized_metadata.get(column)
+                if fields:
+                    self.update_column_metadata(column, **fields)
+
+            # Enregistrement d'une vue temporaire pour la jointure
+            self.conn.register(view_name, nw.to_native(df_nw))
+
+            # Condition de jointure sur les clés primaires (identifiants qualifiés
+            # et quotés des deux côtés)
+            join_condition = " AND ".join(
+                f"f.{quote_ident(k)} = t.{quote_ident(k)}" for k in primary_keys
+            )
+
+            # Comptage des combinaisons de df sans correspondance en base : pas
+            # d'insertion (ce n'est pas un upsert), seulement un avertissement
+            # journalisé avec un échantillon.
+            unmatched_rows = self.conn.execute(f"""
+                SELECT {", ".join(quote_ident(k) for k in primary_keys)}
+                FROM {view_name} t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {fact_table} f WHERE {join_condition}
+                )
+                LIMIT 5
+            """).fetchall()
+            _unmatched_row = self.conn.execute(f"""
+                SELECT COUNT(*) FROM {view_name} t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {fact_table} f WHERE {join_condition}
+                )
+            """).fetchone()
+            unmatched_count = _unmatched_row[0] if _unmatched_row is not None else 0
+            if unmatched_count > 0:
+                self.logger.warning(
+                    f"add_columns: {unmatched_count} key combination(s) in df have"
+                    f" no match in fact_table and will not be inserted (sample:"
+                    f" {unmatched_rows})"
+                )
+
+            # Volume avant écriture : une UPDATE touchant toutes les lignes est une
+            # réécriture complète de la table (copy-on-write).
+            _total_row = self.conn.execute(
+                f"SELECT COUNT(*) FROM {fact_table}"
+            ).fetchone()
+            total_rows = _total_row[0] if _total_row is not None else 0
+            rows_updated = len(df_nw) - unmatched_count
+            self.logger.info(
+                f"add_columns: about to UPDATE {rows_updated} of {total_rows}"
+                f" fact_table row(s) (copy-on-write rewrite of touched files)"
+            )
+
+            # UN SEUL UPDATE ... FROM pour toutes les colonnes concernées (noms non
+            # qualifiés côté gauche du SET : DuckDB rejette les qualificateurs de
+            # table dans la clause SET d'un UPDATE ... FROM)
+            set_clause = ", ".join(
+                f"{quote_ident(c)} = t.{quote_ident(c)}" for c in new_columns
+            )
+            self.conn.execute(f"""
+                UPDATE {fact_table} f
+                SET {set_clause}
+                FROM {view_name} t
+                WHERE {join_condition}
+            """)
+
+            self.conn.execute(f"DROP VIEW {view_name}")
+
+            # Actualisation du statut catégoriel des colonnes VARCHAR concernées
+            # (ajout d'une colonne catégorielle, ou overwrite d'une colonne
+            # existante dont la cardinalité a changé)
+            self._refresh_categorical_flags()
+
+            # dataset_metadata.updated_at
+            self._touch_dataset_metadata()
+
+            self.conn.commit()
+
+        except Exception:
+            self.conn.rollback()
+            try:
+                self.conn.execute(f"DROP VIEW IF EXISTS {view_name}")
+            except Exception:
+                pass
+            raise
+
+        # Nombre de lignes de la base restées NULL : celles qu'aucune ligne de df
+        # n'est venue mettre à jour
+        rows_left_null = total_rows - rows_updated
+        self.logger.info(
+            f"add_columns: {rows_updated} row(s) updated, {rows_left_null}"
+            f" fact_table row(s) left NULL (no match in df)"
+        )
+
+        # Compaction DuckLake optionnelle : un UPDATE massif laisse des fichiers de
+        # suppression (tombstones) sur les anciennes versions des lignes touchées ;
+        # delete_threshold bas car le taux de suppression peut approcher 100%.
+        if compact_after_update:
+            self._run_ducklake_compaction(delete_threshold=0.05)
+
+        self._invalidate_metadata_cache()
+        return True
+
+    # Méthode d'extraction des combinaisons de clés existantes en base
+    def get_key_combinations(
+        self, columns: list[str] | None = None
+    ) -> nw.DataFrame[Any]:
+        """
+        Get distinct existing combinations of key column(s) from the fact table.
+
+        A value carried by a
+        partial key (e.g. ``(region, produit)``) is not automatically spread over
+        a fuller key (e.g. ``(date, region, produit)``) by ``add_columns`` — that
+        would be a different result set, denormalized. To broadcast deliberately,
+        join the caller's partial DataFrame against the full key combinations
+        returned here, then pass the joined DataFrame to ``add_columns``.
+
+        Args:
+            columns: Columns to project. Defaults to every primary key column.
+
+        Returns:
+            nw.DataFrame: Distinct combinations of ``columns`` present in the fact
+            table, one row per combination.
+
+        Raises:
+            ValueError: If no primary key is defined on the fact table and
+                ``columns`` is None, or if ``columns`` references a column absent
+                from the fact table.
+
+        Examples:
+            >>> keys = updater.get_key_combinations(['region', 'produit'])
+            >>> df_partial = keys.join(df_score, on=['region', 'produit'])
+            >>> updater.add_columns(df_partial)
+        """
+        # Colonnes par défaut : toutes les clés primaires
+        if columns is None:
+            columns = self._get_primary_key_columns()
+            if not columns:
+                raise ValueError(
+                    "No primary key is defined on the fact_table; pass columns"
+                    " explicitly."
+                )
+
+        # Validation de l'existence des colonnes demandées
+        existing_columns = set(self._get_fact_table_columns())
+        unknown = [c for c in columns if c not in existing_columns]
+        if unknown:
+            raise ValueError(f"Unknown column(s) in fact_table: {sorted(unknown)}")
+
+        # Création de la requête
+        column_list = ", ".join(quote_ident(c) for c in columns)
+        result = self.conn.execute(
+            f"SELECT DISTINCT {column_list} FROM {self._qualified('fact_table')}"
+        ).pl()
+        return nw.from_native(result, eager_only=True)
 
     # Méthodes publiques additionnelles
     # Méthode d'extraction du statut de la base de données

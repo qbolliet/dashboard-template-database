@@ -351,6 +351,62 @@ def test_delete_columns_parent_with_cascade_detaches_children(
 
 
 # ---------------------------------------------------------------------------
+# Tests de delete_columns() et cluster_by (§4.3, §5.3)
+# ---------------------------------------------------------------------------
+
+
+# Test que la suppression d'une colonne de cluster_by la retire de la liste
+def test_delete_columns_removes_column_from_cluster_by(
+    deleter: DatabaseDeleter, built_ducklake_schema: Any
+) -> None:
+    """Test that dropping a cluster_by column removes it from cluster_by.
+
+    Args:
+        deleter: DatabaseDeleter fixture.
+        built_ducklake_schema: DuckDB connection with the built schema
+            (cluster_by defaults to ['id']).
+    """
+    deleter.update_cluster_by(["id", "category"])
+
+    result = deleter.delete_columns(["category"], use_transaction=False)
+
+    assert result == {"category": True}
+    assert deleter._get_cluster_by_columns() == ["id"]
+
+
+# Test que vider entièrement cluster_by le remet à NULL (pas une liste vide)
+def test_delete_columns_cluster_by_falls_back_to_null_when_emptied(
+    deleter: DatabaseDeleter,
+) -> None:
+    """Test that dropping the only cluster_by column resets it to NULL.
+
+    Args:
+        deleter: DatabaseDeleter fixture.
+    """
+    deleter.update_cluster_by(["category"])
+
+    result = deleter.delete_columns(["category"], use_transaction=False)
+
+    assert result == {"category": True}
+    assert deleter._get_cluster_by_columns() is None
+
+
+# Test que la suppression d'une colonne hors cluster_by ne modifie pas cluster_by
+def test_delete_columns_leaves_cluster_by_untouched_when_unrelated(
+    deleter: DatabaseDeleter,
+) -> None:
+    """Test that deleting a column not in cluster_by leaves it unchanged.
+
+    Args:
+        deleter: DatabaseDeleter fixture (cluster_by defaults to ['id']).
+    """
+    result = deleter.delete_columns(["category"], use_transaction=False)
+
+    assert result == {"category": True}
+    assert deleter._get_cluster_by_columns() == ["id"]
+
+
+# ---------------------------------------------------------------------------
 # Test de bout en bout de la compaction DuckLake après delete (§5.4-5.5)
 # ---------------------------------------------------------------------------
 
@@ -394,4 +450,55 @@ def test_delete_rows_compacts_on_real_ducklake_catalog(tmp_path: Any) -> None:
     assert deleted == 1
     row_count = conn.execute("SELECT COUNT(*) FROM fact_table").fetchone()[0]
     assert row_count == 4
+    conn.close()
+
+
+# Test que delete_columns ne change pas file_count (§4.3 : opération de métadonnées)
+@pytest.mark.skipif(
+    not _ducklake_available(),
+    reason="Extension ducklake non disponible dans cet environnement",
+)
+def test_delete_columns_does_not_change_file_count(tmp_path: Any) -> None:
+    """Test that ALTER TABLE ... DROP COLUMN rewrites no data file (measured, §4.3).
+
+    Against an in-memory connection there is no attached DuckLake catalog for
+    ``ducklake_table_info`` to query, so this needs a real one on disk (mirrors
+    ``test_delete_rows_compacts_on_real_ducklake_catalog``).
+
+    Args:
+        tmp_path: pytest temporary directory.
+    """
+    catalog = str(tmp_path / "test.ducklake")
+    data_dir = str(tmp_path / "data")
+    os.makedirs(data_dir)
+    conn = DuckLakeConnector(catalog, data_dir, data_inlining_row_limit=0).connect()
+
+    df = pl.DataFrame(
+        {
+            "id": list(range(1, 6)),
+            "category": ["A", "B", "A", "C", "B"],
+            "value": [0.1, 0.2, 0.3, 0.4, 0.5],
+        }
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        DuckLakeTablesBuilder(
+            df, categorical_threshold=4, primary_keys=["id"], connection=conn
+        ).build_schema()
+
+    file_count_before = conn.execute(
+        "SELECT file_count FROM ducklake_table_info('db') WHERE table_name ="
+        " 'fact_table'"
+    ).fetchone()[0]
+    assert file_count_before > 0
+
+    deleter = DatabaseDeleter(connection=conn, categorical_threshold=4)
+    result = deleter.delete_columns(["value"], use_transaction=False)
+    assert result == {"value": True}
+
+    file_count_after = conn.execute(
+        "SELECT file_count FROM ducklake_table_info('db') WHERE table_name ="
+        " 'fact_table'"
+    ).fetchone()[0]
+    assert file_count_after == file_count_before
     conn.close()

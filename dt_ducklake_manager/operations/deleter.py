@@ -448,7 +448,11 @@ class DatabaseDeleter(BaseSchemaManager):
         A column that is the parent of another column in a hierarchy cannot
         be deleted by default: it would silently orphan its children's
         ``parent_name``. Pass ``cascade=True`` to allow it anyway; every child's
-        ``parent_name`` is then reset to ``NULL``, with a warning.
+        ``parent_name`` is then reset to ``NULL``, with a warning. A dropped column
+        that is part of ``dataset_metadata.cluster_by`` is also removed from it
+        (reset to ``NULL`` if it was the only sort column), with a warning.
+        ``ALTER TABLE ... DROP COLUMN`` is a DuckLake metadata-only operation: no
+        data file is rewritten.
 
         Args:
             columns: List of column names to delete
@@ -564,6 +568,9 @@ class DatabaseDeleter(BaseSchemaManager):
                     self.transaction_mgr.add_operation(tx_id, **operation.__dict__)
                     self.transaction_mgr.execute_operation(tx_id)
 
+                    # Retrait de la colonne de cluster_by si elle en faisait partie
+                    self._remove_from_cluster_by(column)
+
                     results[column] = True
 
                 except Exception as e:
@@ -643,6 +650,10 @@ class DatabaseDeleter(BaseSchemaManager):
 
                     # Suppression des métadonnées
                     self.delete_column_metadata(column)
+
+                    # Retrait de la colonne de cluster_by si elle en faisait partie
+                    if dropped_columns:
+                        self._remove_from_cluster_by(column)
 
                     results[column] = len(dropped_columns) > 0
 

@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 import duckdb
+import narwhals as nw
 import polars as pl
 
 # Module de tests
@@ -525,6 +526,91 @@ def test_update_database_preserves_ui_metadata(
 
 
 # ---------------------------------------------------------------------------
+# Tests de update_database() et des colonnes inconnues (§4.2, allow_new_columns)
+# ---------------------------------------------------------------------------
+
+
+# Test qu'une colonne inconnue sans allow_new_columns lève une ValueError
+def test_update_database_unknown_column_without_allow_raises(
+    updater: DatabaseUpdater, built_ducklake_schema: Any
+) -> None:
+    """Test that an unknown DataFrame column is refused by default.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+        built_ducklake_schema: DuckDB connection.
+    """
+    df = pl.DataFrame({"id": [10], "category": ["A"], "new_col": ["x"]})
+
+    with pytest.raises(ValueError, match="new_col"):
+        updater.update_database(update_df=df, keep="first", use_transaction=False)
+
+    # La colonne n'a pas été ajoutée
+    columns = [
+        row[0]
+        for row in built_ducklake_schema.execute("DESCRIBE fact_table").fetchall()
+    ]
+    assert "new_col" not in columns
+
+
+# Test qu'avec allow_new_columns=True la colonne est ajoutée avec ses métadonnées
+def test_update_database_allow_new_columns_adds_column_and_metadata(
+    updater: DatabaseUpdater, built_ducklake_schema: Any
+) -> None:
+    """Test that allow_new_columns=True adds the column and a metadata row.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+        built_ducklake_schema: DuckDB connection.
+    """
+    df = pl.DataFrame({"id": [10], "category": ["A"], "score": [1.5]})
+
+    result = updater.update_database(
+        update_df=df,
+        keep="first",
+        use_transaction=False,
+        allow_new_columns=True,
+        column_metadata={"score": {"unit": "%", "default_aggregation": "avg"}},
+    )
+    assert result is True
+
+    # La colonne existe désormais dans la fact table, avec la bonne valeur
+    row = built_ducklake_schema.execute(
+        "SELECT score FROM fact_table WHERE id = 10"
+    ).fetchone()
+    assert row == (1.5,)
+
+    # La ligne metadata a été créée, is_primary_key=FALSE, champs d'UI appliqués
+    meta = built_ducklake_schema.execute(
+        "SELECT sql_type, is_primary_key, unit, default_aggregation"
+        " FROM metadata WHERE name = 'score'"
+    ).fetchone()
+    assert meta == ("DOUBLE", False, "%", "AVG")
+
+
+# Test que column_metadata mal formé lève une ValueError avant tout ajout
+def test_update_database_allow_new_columns_invalid_metadata_raises(
+    updater: DatabaseUpdater, built_ducklake_schema: Any
+) -> None:
+    """Test that an unknown column_metadata key raises ValueError.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+        built_ducklake_schema: DuckDB connection.
+    """
+    df = pl.DataFrame({"id": [10], "category": ["A"], "score": [1.5]})
+
+    with pytest.raises(ValueError, match="Unknown column_metadata key"):
+        updater.update_database(
+            update_df=df,
+            keep="first",
+            use_transaction=False,
+            allow_new_columns=True,
+            column_metadata={"score": {"not_a_field": "x"}},
+        )
+
+
+# ---------------------------------------------------------------------------
 # Test de bout en bout de la compaction DuckLake après update (§5.4-5.5)
 # ---------------------------------------------------------------------------
 
@@ -579,4 +665,335 @@ def test_update_database_compacts_on_real_ducklake_catalog(tmp_path: Any) -> Non
 
     row_count = conn.execute("SELECT COUNT(*) FROM fact_table").fetchone()[0]
     assert row_count == 7
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests de add_columns() (§4.3)
+# ---------------------------------------------------------------------------
+
+
+# Test qu'add_columns refuse une base sans clé primaire
+def test_add_columns_no_primary_key_raises() -> None:
+    """Test that add_columns refuses a fact_table without a primary key."""
+    conn = duckdb.connect(":memory:")
+    df = pl.DataFrame({"id": [1, 2], "value": [0.1, 0.2]})
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        DuckLakeTablesBuilder(
+            df, categorical_threshold=4, primary_keys=[], connection=conn
+        ).build_schema()
+
+    updater = DatabaseUpdater(connection=conn, categorical_threshold=4)
+    with pytest.raises(ValueError, match="No primary key"):
+        updater.add_columns(pl.DataFrame({"id": [1], "score": [1.0]}))
+
+
+# Test qu'add_columns refuse un DataFrame sans clé primaire
+def test_add_columns_missing_primary_key_raises(updater: DatabaseUpdater) -> None:
+    """Test that add_columns refuses a df missing the primary key column.
+
+    Args:
+        updater: DatabaseUpdater fixture (primary key: 'id').
+    """
+    df = pl.DataFrame({"score": [1.0, 2.0]})
+    with pytest.raises(ValueError, match="missing primary key"):
+        updater.add_columns(df)
+
+
+# Test qu'add_columns refuse un DataFrame non-unique sur les clés primaires
+def test_add_columns_duplicate_keys_raises(updater: DatabaseUpdater) -> None:
+    """Test that add_columns refuses a df with duplicate primary key values.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+    """
+    df = pl.DataFrame({"id": [1, 1], "score": [1.0, 2.0]})
+    with pytest.raises(ValueError, match="unique on primary key"):
+        updater.add_columns(df)
+
+
+# Test qu'add_columns refuse un DataFrame ne portant que des clés primaires
+def test_add_columns_no_value_column_raises(updater: DatabaseUpdater) -> None:
+    """Test that add_columns refuses a df carrying only primary key columns.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+    """
+    df = pl.DataFrame({"id": [1, 2]})
+    with pytest.raises(ValueError, match="no value column"):
+        updater.add_columns(df)
+
+
+# Test qu'add_columns ajoute une nouvelle colonne avec ses valeurs et ses métadonnées
+def test_add_columns_adds_new_column(
+    updater: DatabaseUpdater, built_ducklake_schema: Any
+) -> None:
+    """Test that add_columns adds a new column, sets values, and creates metadata.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+        built_ducklake_schema: DuckDB connection (ids 1..5).
+    """
+    df = pl.DataFrame({"id": [1, 2, 3], "score": [10.0, 20.0, 30.0]})
+
+    result = updater.add_columns(df, column_metadata={"score": {"unit": "pts"}})
+    assert result is True
+
+    rows = built_ducklake_schema.execute(
+        "SELECT id, score FROM fact_table ORDER BY id"
+    ).fetchall()
+    assert rows == [(1, 10.0), (2, 20.0), (3, 30.0), (4, None), (5, None)]
+
+    meta = built_ducklake_schema.execute(
+        "SELECT sql_type, is_primary_key, unit FROM metadata WHERE name = 'score'"
+    ).fetchone()
+    assert meta == ("DOUBLE", False, "pts")
+
+
+# Test qu'add_columns refuse une colonne déjà existante sans overwrite
+def test_add_columns_existing_column_without_overwrite_raises(
+    updater: DatabaseUpdater,
+) -> None:
+    """Test that add_columns refuses an already-existing column by default.
+
+    Args:
+        updater: DatabaseUpdater fixture ('value' already exists).
+    """
+    df = pl.DataFrame({"id": [1], "value": [99.0]})
+    with pytest.raises(ValueError, match="already exist"):
+        updater.add_columns(df)
+
+    # La valeur n'a pas été modifiée
+    row = updater.conn.execute("SELECT value FROM fact_table WHERE id = 1").fetchone()
+    assert row[0] != 99.0
+
+
+# Test qu'add_columns avec overwrite=True met à jour les valeurs existantes
+def test_add_columns_existing_column_with_overwrite_updates_values(
+    updater: DatabaseUpdater, built_ducklake_schema: Any
+) -> None:
+    """Test that overwrite=True lets add_columns replace existing values.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+        built_ducklake_schema: DuckDB connection.
+    """
+    df = pl.DataFrame({"id": [1], "value": [99.0]})
+    result = updater.add_columns(df, overwrite=True)
+    assert result is True
+
+    row = built_ducklake_schema.execute(
+        "SELECT value FROM fact_table WHERE id = 1"
+    ).fetchone()
+    assert row[0] == 99.0
+
+
+# Test que les combinaisons de df sans correspondance en base ne sont pas insérées
+def test_add_columns_unmatched_combination_not_inserted(
+    updater: DatabaseUpdater, built_ducklake_schema: Any, caplog: Any
+) -> None:
+    """Test that a df key combination absent from fact_table is skipped, not inserted.
+
+    Args:
+        updater: DatabaseUpdater fixture (ids 1..5).
+        built_ducklake_schema: DuckDB connection.
+        caplog: pytest fixture capturing log records.
+    """
+    initial_count = built_ducklake_schema.execute(
+        "SELECT COUNT(*) FROM fact_table"
+    ).fetchone()[0]
+
+    df = pl.DataFrame({"id": [1, 999], "score": [10.0, 20.0]})
+    result = updater.add_columns(df)
+    assert result is True
+
+    final_count = built_ducklake_schema.execute(
+        "SELECT COUNT(*) FROM fact_table"
+    ).fetchone()[0]
+    assert final_count == initial_count
+
+    assert any("no match in fact_table" in record.message for record in caplog.records)
+
+
+# Test que les lignes de la base sans correspondance dans df restent NULL
+def test_add_columns_rows_without_match_left_null(
+    updater: DatabaseUpdater, built_ducklake_schema: Any
+) -> None:
+    """Test that fact_table rows absent from df keep NULL in the new column.
+
+    Args:
+        updater: DatabaseUpdater fixture (ids 1..5).
+        built_ducklake_schema: DuckDB connection.
+    """
+    df = pl.DataFrame({"id": [1], "score": [10.0]})
+    updater.add_columns(df)
+
+    null_count = built_ducklake_schema.execute(
+        "SELECT COUNT(*) FROM fact_table WHERE score IS NULL"
+    ).fetchone()[0]
+    assert null_count == 4
+
+
+# Test qu'un échec en cours d'opération ne laisse subsister ni colonne ni métadonnée
+def test_add_columns_failure_mid_operation_leaves_no_trace(
+    updater: DatabaseUpdater, built_ducklake_schema: Any, monkeypatch: Any
+) -> None:
+    """Test that a failure during add_columns rolls back the column and metadata.
+
+    ``DuckDBPyConnection.execute`` is a read-only C-extension attribute and can't
+    be monkeypatched directly, so the failure is forced on
+    ``_touch_dataset_metadata`` instead: it runs last, inside the same
+    transaction, right after the ``ALTER TABLE``, the metadata row insert and the
+    ``UPDATE ... FROM`` have all succeeded. If the single transaction is real, none
+    of them survive the rollback.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+        built_ducklake_schema: DuckDB connection.
+        monkeypatch: pytest fixture for patching.
+    """
+
+    def failing_touch() -> None:
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(updater, "_touch_dataset_metadata", failing_touch)
+
+    df = pl.DataFrame({"id": [1], "score": [10.0]})
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        updater.add_columns(df)
+
+    columns_after = [
+        row[0]
+        for row in built_ducklake_schema.execute("DESCRIBE fact_table").fetchall()
+    ]
+    assert "score" not in columns_after
+    meta_count = built_ducklake_schema.execute(
+        "SELECT COUNT(*) FROM metadata WHERE name = 'score'"
+    ).fetchone()[0]
+    assert meta_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests de get_key_combinations() (§4.3, recette de diffusion explicite)
+# ---------------------------------------------------------------------------
+
+
+# Test que get_key_combinations retourne les clés primaires par défaut
+def test_get_key_combinations_default_primary_keys(
+    updater: DatabaseUpdater,
+) -> None:
+    """Test that get_key_combinations defaults to all primary key columns.
+
+    Args:
+        updater: DatabaseUpdater fixture (ids 1..5, primary key 'id').
+    """
+    combos = updater.get_key_combinations()
+    assert combos.columns == ["id"]
+    assert sorted(combos["id"].to_list()) == [1, 2, 3, 4, 5]
+
+
+# Test que get_key_combinations projette les colonnes explicitement demandées
+def test_get_key_combinations_explicit_columns(updater: DatabaseUpdater) -> None:
+    """Test that get_key_combinations projects the requested columns.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+    """
+    combos = updater.get_key_combinations(["category"])
+    assert combos.columns == ["category"]
+    assert set(combos["category"].to_list()) == {"A", "B", "C"}
+
+
+# Test que get_key_combinations refuse une colonne absente de la fact table
+def test_get_key_combinations_unknown_column_raises(
+    updater: DatabaseUpdater,
+) -> None:
+    """Test that get_key_combinations raises ValueError for an unknown column.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+    """
+    with pytest.raises(ValueError, match="Unknown column"):
+        updater.get_key_combinations(["not_a_column"])
+
+
+# Test de la recette de diffusion explicite (§4.3 : jointure puis add_columns)
+def test_get_key_combinations_explicit_broadcast_recipe(
+    updater: DatabaseUpdater, built_ducklake_schema: Any
+) -> None:
+    """Test the explicit broadcast recipe: join partial-key values onto full keys.
+
+    A value carried by a partial key (here 'category') is not spread onto the
+    full key ('id') automatically; the user must join it explicitly before
+    calling ``add_columns``.
+
+    Args:
+        updater: DatabaseUpdater fixture.
+        built_ducklake_schema: DuckDB connection (ids 1..5, categories A/B/A/C/B).
+    """
+    keys = updater.get_key_combinations(["id", "category"])
+    df_partial = pl.DataFrame({"category": ["A", "B", "C"], "bonus": [1, 2, 3]})
+
+    # Jointure explicite puis retrait de la colonne de clé partielle : seule 'id'
+    # (clé primaire de la fact table) doit rester à côté de la valeur diffusée.
+    broadcast_df = (
+        nw.to_native(keys).join(df_partial, on="category", how="inner").drop("category")
+    )
+
+    result = updater.add_columns(nw.from_native(broadcast_df, eager_only=True))
+    assert result is True
+
+    rows = dict(
+        built_ducklake_schema.execute(
+            "SELECT id, bonus FROM fact_table ORDER BY id"
+        ).fetchall()
+    )
+    # category : id1=A, id2=B, id3=A, id4=C, id5=B
+    assert rows == {1: 1, 2: 2, 3: 1, 4: 3, 5: 2}
+
+
+# ---------------------------------------------------------------------------
+# Test de bout en bout d'add_columns sur un catalogue DuckLake réel (§4.3, §5.1)
+# ---------------------------------------------------------------------------
+
+
+# Test qu'add_columns réussit avec compaction réelle sur un catalogue sur disque
+@pytest.mark.skipif(
+    not _ducklake_available(),
+    reason="Extension ducklake non disponible dans cet environnement",
+)
+def test_add_columns_on_real_ducklake_catalog(tmp_path: Any) -> None:
+    """Test that add_columns succeeds end-to-end against a real DuckLake catalog.
+
+    Args:
+        tmp_path: pytest temporary directory.
+    """
+    catalog = str(tmp_path / "test.ducklake")
+    data_dir = str(tmp_path / "data")
+    os.makedirs(data_dir)
+    conn = DuckLakeConnector(catalog, data_dir, data_inlining_row_limit=0).connect()
+
+    df = pl.DataFrame(
+        {
+            "id": list(range(1, 6)),
+            "category": ["A", "B", "A", "C", "B"],
+            "value": [0.1, 0.2, 0.3, 0.4, 0.5],
+        }
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        DuckLakeTablesBuilder(
+            df, categorical_threshold=4, primary_keys=["id"], connection=conn
+        ).build_schema()
+
+    updater = DatabaseUpdater(connection=conn, categorical_threshold=4)
+    score_df = pl.DataFrame({"id": [1, 2, 3], "score": [10.0, 20.0, 30.0]})
+
+    assert updater.add_columns(score_df) is True
+
+    row_count = conn.execute(
+        "SELECT COUNT(*) FROM fact_table WHERE score IS NOT NULL"
+    ).fetchone()[0]
+    assert row_count == 3
     conn.close()

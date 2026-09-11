@@ -807,3 +807,45 @@ def test_update_cluster_by_unknown_column_raises(manager: DataManager) -> None:
     """
     with pytest.raises(ValueError, match="cluster_by columns"):
         manager.update_cluster_by(["not_a_column"])
+
+
+# Tests de _remove_from_cluster_by() (§4.3, retrait au drop d'une colonne)
+# ===========================================================================
+
+
+# Test que _remove_from_cluster_by retire une colonne parmi plusieurs
+def test_remove_from_cluster_by_drops_one_of_several(manager: DataManager) -> None:
+    """Test that _remove_from_cluster_by removes only the targeted column.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    manager.update_cluster_by(["id", "category"])
+    manager._remove_from_cluster_by("category")
+    assert manager._get_cluster_by_columns() == ["id"]
+
+
+# Test que _remove_from_cluster_by remet cluster_by à NULL une fois vidée
+def test_remove_from_cluster_by_falls_back_to_null_when_emptied(
+    manager: DataManager,
+) -> None:
+    """Test that emptying cluster_by resets it to NULL, not an empty list.
+
+    Args:
+        manager: DataManager fixture with a built schema.
+    """
+    manager.update_cluster_by(["category"])
+    manager._remove_from_cluster_by("category")
+    assert manager._get_cluster_by_columns() is None
+
+
+# Test que _remove_from_cluster_by ne fait rien si la colonne n'y est pas
+def test_remove_from_cluster_by_noop_when_absent(manager: DataManager) -> None:
+    """Test that _remove_from_cluster_by is a no-op for an unrelated column.
+
+    Args:
+        manager: DataManager fixture with a built schema (cluster_by defaults to
+            ['id']).
+    """
+    manager._remove_from_cluster_by("category")
+    assert manager._get_cluster_by_columns() == ["id"]

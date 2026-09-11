@@ -13,72 +13,10 @@ from ..utils.logger import _init_logger
 
 # Utilitaires de traitement des données
 from ..utils.types import (
-    COLUMN_METADATA_KEYS,
     UI_METADATA_FIELDS,
     map_python_to_sql_type,
-    normalize_default_aggregation,
+    validate_column_metadata,
 )
-
-
-# Fonction de validation du dictionnaire ``column_metadata``
-def _validate_column_metadata(
-    column_metadata: dict[str, dict[str, str]] | None,
-    columns: list[str],
-) -> dict[str, dict[str, str | None]]:
-    """
-    Validate and normalize a ``column_metadata`` mapping.
-
-    Args:
-        column_metadata: Mapping of column name to a sub-dictionary of UI fields
-            (``label``, ``parent_name``, ``unit``, ``display_format``, ``family``,
-            ``description``, ``default_aggregation``), all keys optional. ``None``
-            yields an empty mapping. Note that ``parent_name`` existence and
-            forest validation happen later, in ``SchemaBuilder._resolve_hierarchies``.
-        columns: Column names available in the source DataFrame.
-
-    Returns:
-        dict[str, dict[str, str | None]]: The mapping with ``default_aggregation``
-        upper-cased, ready to be consumed by the builder.
-
-    Raises:
-        ValueError: If a referenced column is absent from ``columns``, if a
-            sub-dictionary carries an unknown key, or if ``default_aggregation`` is
-            not an allowed value.
-
-    Examples:
-        >>> _validate_column_metadata({'a': {'unit': '€'}}, ['a'])
-        {'a': {'unit': '€'}}
-    """
-    # Absence de métadonnées d'UI : mapping vide
-    if not column_metadata:
-        return {}
-
-    # Vérification de l'existence des colonnes référencées
-    unknown_cols = set(column_metadata) - set(columns)
-    if unknown_cols:
-        raise ValueError(
-            f"The following column_metadata columns do not exist in the DataFrame: "
-            f"{sorted(unknown_cols)}"
-        )
-
-    # Contrôle des clés de chaque sous-dictionnaire et normalisation de l'agrégation
-    normalized: dict[str, dict[str, str | None]] = {}
-    for col, fields in column_metadata.items():
-        unknown_keys = set(fields) - COLUMN_METADATA_KEYS
-        if unknown_keys:
-            raise ValueError(
-                f"Unknown column_metadata key(s) for column {col!r}: "
-                f"{sorted(unknown_keys)}; allowed keys are "
-                f"{sorted(COLUMN_METADATA_KEYS)}"
-            )
-        col_fields: dict[str, str | None] = dict(fields)
-        if "default_aggregation" in col_fields:
-            col_fields["default_aggregation"] = normalize_default_aggregation(
-                col_fields["default_aggregation"]
-            )
-        normalized[col] = col_fields
-
-    return normalized
 
 
 # Classe de création d'une base de données DuckDB avec :
@@ -378,7 +316,7 @@ class SchemaBuilder:
              'name', 'sql_type', 'unit']
         """
         # Validation et normalisation des métadonnées d'UI fournies par le producteur
-        column_metadata_norm = _validate_column_metadata(
+        column_metadata_norm = validate_column_metadata(
             column_metadata, list(self.df.columns)
         )
 
